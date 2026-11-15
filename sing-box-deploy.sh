@@ -28,6 +28,9 @@ DEFAULT_HY2_PORT='443'
 DEFAULT_ANYTLS_PORT='8443' # AnyTLS uses TCP; must differ from VLESS_PORT.
 DEFAULT_HY2_HOP_PORTS='' # Empty disables hopping; e.g. 20000:20100,30000.
 DEFAULT_HY2_HOP_INTERVAL='30s'
+DEFAULT_HY2_BBR_PROFILE='standard'
+HY2_BBR_PROFILE_REQUEST="${HY2_BBR_PROFILE-}"
+HY2_BBR_PROFILE="${HY2_BBR_PROFILE-$DEFAULT_HY2_BBR_PROFILE}"
 HY2_HOP_PORTS_REQUEST="${HY2_HOP_PORTS-}"
 HY2_HOP_INTERVAL_REQUEST="${HY2_HOP_INTERVAL-}"
 HY2_HOP_PORTS="${HY2_HOP_PORTS-$DEFAULT_HY2_HOP_PORTS}"
@@ -105,9 +108,11 @@ success() { printf '\n' >&2; ui success "[成功] $*" >&2; }
 warn() { printf '\n' >&2; ui warning "[提示] $*" >&2; }
 die() { printf '\n' >&2; ui error "[ERROR] $*" >&2; exit 1; }
 [[ "$SOCKS_TFO" == true || "$SOCKS_TFO" == false ]] || die 'SOCKS_TFO must be true or false.'
+[[ "$HY2_BBR_PROFILE" == standard || "$HY2_BBR_PROFILE" == conservative || "$HY2_BBR_PROFILE" == aggressive ]] || die 'HY2_BBR_PROFILE 必须是 standard、conservative 或 aggressive。'
 # Snapshot before the first mutation; keep backups if restoration itself fails.
 begin_transaction() {
   local mode="$1" path index=0
+  [[ ${STAGING:-0} != 1 ]] || mode=files
   shift
   [[ -z "$TRANSACTION" ]] || die "已有未完成的配置操作。"
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
@@ -201,9 +206,13 @@ usage() {
 用法：以 root 身份运行 bash sing-box-deploy.sh [命令]
   不带参数 / menu       进入中文管理菜单（非交互运行时显示帮助）
   install              安装 VLESS Reality + Hysteria2 + AnyTLS 及三组 SOCKS5
+  apply                应用全部待应用修改并重启服务（失败自动回滚，保留待应用修改）
+  discard-pending      丢弃待应用修改；非交互需 DISCARD_CONFIRM=YES
+  summary              显示真实服务/版本、已确认运行配置及待应用配置
   set-ports            修改端口，默认保留当前值；可传 VLESS_PORT、HY2_PORT、ANYTLS_PORT
   add-anytls           为旧部署添加 AnyTLS；可传 ANYTLS_PORT、NEW_ANYTLS_SNI、NEW_ANYTLS_PASS
   export-yaml          可选导出 Clash/Mihomo proxies.yaml；普通生成/导出只在结果中显示 YAML
+  set-hy2-bbr          设置 HY2 BBR 档位，默认 standard；可传 HY2_BBR_PROFILE；保存后需 apply
   set-hopping          HY2 端口跳跃，支持 HY2_HOP_PORTS、HY2_HOP_EXCLUDE、HY2_HOP_INTERVAL
   update               通过官方软件源更新 sing-box，先取得当前版本回滚包
   backup [文件路径]    私密配置备份（默认 /var/backups/sing-box-deploy）
@@ -223,7 +232,9 @@ usage() {
 
 终端使用颜色强调状态与风险；重定向、TERM=dumb 或 NO_COLOR 时输出纯文本。
 源码顶部 DEFAULT_* 是首次安装默认值，环境变量优先，交互输入可覆盖。
-VLESS/HY2 端口默认 443，AnyTLS TCP 默认 8443，SOCKS5 TFO 默认开启。普通修改保留未选择的凭据。
+端口、TFO 等默认值读取源码顶部 DEFAULT_* 与环境变量；普通修改沿用当前值并保留未选择的凭据。
+协议、SOCKS 和跳跃设置的修改仅保存到待应用区，执行 apply 才更新服务、防火墙和跳跃规则。
+普通 show/export 查看已应用资料；待应用节点资料位于 deployment/pending/client，应用前不要导入。
 安装支持 AI_SOCKS_*、GOOGLE_SOCKS_*、OTHER_SOCKS_*、SERVER_IP 等环境变量。
 请勿把密码放入命令参数或公开日志；填写凭据后的源码也应妥善保护。
 UFW/firewalld 放行规则持久化；裸 nftables/iptables 仅当前运行时生效。
@@ -498,7 +509,7 @@ PYCODE
 }
 
 write_jsons() {
-  export APP CONFIG REALITY_DOMAIN AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS SOCKS_TFO
+  export APP CONFIG REALITY_DOMAIN AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS HY2_BBR_PROFILE SOCKS_TFO
   python3 - <<'PYCODE'
 import json, os, pathlib, urllib.parse
 p = pathlib.Path(os.environ['APP'])
@@ -531,6 +542,7 @@ config = {
              'private_key':e['REALITY_PRIVATE'], 'short_id':[e['SHORT_ID']],
              'max_time_difference':'1m'}}},
    {'type':'hysteria2','tag':'hysteria2','listen':'0.0.0.0','listen_port':int(e['HY2_PORT']),
+    'bbr_profile':e['HY2_BBR_PROFILE'],
     'users':[{'name':'main','password':e['HY2_PASS']}],
     'obfs':{'type':'salamander','password':e['HY2_OBFS_PASS']},
     'tls':{'enabled':True,'server_name':e['REALITY_DOMAIN'],'alpn':['h3'],
@@ -589,7 +601,7 @@ for name, obj in clients.items():
     write_json(p/'client'/name,obj)
 
 PYCODE
-  "$BIN" check -C /etc/sing-box || die 'sing-box check failed. Service was not started.'
+  check_configuration || die 'sing-box check failed. Service was not started.'
   node_config export
 }
 
@@ -610,10 +622,12 @@ start_official_unit() {
     [[ "$tcp" == *'"sing-box"'* ]] || die "服务未监听 AnyTLS TCP/$ANYTLS_PORT。"
   fi
   systemctl enable "$UNIT"
+  record_runtime_state
 }
 
 # Add rules through the active manager; only journal additions made by this run.
 open_firewall() {
+  [[ ${STAGING:-0} != 1 ]] || return 0
   local ufw_active=0 firewalld_active=0 output rc entry zone zones mode port proto rules chains family table chain
   local -a endpoints=()
   if [[ "${1:-}" != "$VLESS_PORT" && "${3:-}" != "$VLESS_PORT" ]]; then endpoints+=("$VLESS_PORT/tcp"); fi
@@ -903,7 +917,7 @@ set_socks_profile() {
     read_socks_profile "$profile"
     check_socks "$profile"
   done
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   begin_transaction update "$CONFIG" "$APP/client/node-info.txt"
   export CONFIG APP SOCKS_TFO REQUEST_SOCKS_TFO
   python3 - "$@" <<'PYCODE'
@@ -947,16 +961,18 @@ if 'other' in sys.argv[1:]:
                                            'Everything else: Other SOCKS5; private IPs rejected'))
 PYCODE
   forget_socks
-  "$BIN" check -C /etc/sing-box
+  check_configuration
+  if [[ ${STAGING:-0} != 1 ]]; then
   systemctl restart "$UNIT"
   sleep 2
   if ! systemctl is-active --quiet "$UNIT"; then
     journalctl -u "$UNIT" -n 40 --no-pager >&2 || true
     die 'Service failed after configuration update.'
   fi
+  fi
   show_node_details
   TRANSACTION=""
-  log 'Configuration updated, checked and service restarted.'
+  if [[ ${STAGING:-0} != 1 ]]; then log 'Configuration updated, checked and service restarted.'; fi
 }
 
 show_node_details() {
@@ -965,13 +981,177 @@ show_node_details() {
 }
 
 # Shared reader/writer for installed node settings and client exports.
+# Pending edits never touch the active configuration, certificates or network rules.
+check_configuration() {
+  if [[ ${STAGING:-0} == 1 ]]; then "$BIN" check -c "$CONFIG"
+  else "$BIN" check -C /etc/sing-box; fi
+}
+
+relocate_tls_paths() {
+  python3 - "$1" "$2" "$3" <<'PYCODE'
+import json,pathlib,sys
+path,old,new = pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3])
+if path.is_symlink(): sys.exit('配置文件是符号链接，拒绝覆盖。')
+c=json.loads(path.read_text())
+for inbound in c.get('inbounds',[]):
+    for key in ('certificate_path','key_path'):
+        tls=inbound.get('tls',{})
+        if key not in tls: continue
+        try: relative=pathlib.Path(tls[key]).relative_to(old/'tls')
+        except ValueError: continue
+        tls[key]=str(new/'tls'/relative)
+path.write_text(json.dumps(c,indent=2,ensure_ascii=False)+'\n')
+path.chmod(0o600)
+PYCODE
+}
+
+pending_fingerprint() {
+  python3 - "$1" <<'PYCODE'
+import hashlib,pathlib,sys
+root=pathlib.Path(sys.argv[1]); digest=hashlib.sha256()
+for path in sorted(root.rglob('*')):
+    if path.is_dir() and not path.is_symlink(): continue
+    digest.update(str(path.relative_to(root)).encode()+b'\0')
+    digest.update((str(path.readlink()).encode() if path.is_symlink() else path.read_bytes())+b'\0')
+print(digest.hexdigest())
+PYCODE
+}
+
+stage_changes() {
+  need_root
+  [[ -f "$CONFIG" && -d "$APP/client" ]] || die '请先安装节点。'
+  local pending="$APP/pending" name existed=0 before
+  [[ ! -d "$pending" ]] || existed=1
+  begin_transaction files "$pending"
+  if [[ ! -d "$pending" ]]; then
+    install -d -m 0700 "$pending"
+    for name in tls client; do
+      [[ ! -L "$APP/$name" ]] || die '拒绝暂存符号链接目录。'
+      cp -a "$APP/$name" "$pending/$name"
+    done
+    sha256sum "$CONFIG" | cut -d ' ' -f1 > "$pending/base.sha256"
+    cp -a "$CONFIG" "$pending/config.json"
+    if [[ -f "$APP/hopping.json" ]]; then cp -a "$APP/hopping.json" "$pending/hopping.json"; fi
+    relocate_tls_paths "$pending/config.json" "$APP" "$pending"
+  fi
+  before="$(pending_fingerprint "$pending")"
+  ui warning '正在编辑待应用配置；保存不会重载服务、证书、防火墙或跳跃规则。'
+  (
+    APP="$pending" CONFIG="$pending/config.json" STAGING=1
+    TEMP='' TRANSACTION='' ROLLBACK_PATHS=() ROLLBACK_EXISTS=()
+    trap cleanup EXIT
+    "$@"
+  )
+  if [[ "$(pending_fingerprint "$pending")" == "$before" ]]; then
+    if (( ! existed )); then rm -rf -- "$pending"; fi
+    TRANSACTION=''
+    log '本次设置没有变化；已有待应用修改保持不变。'
+    return 0
+  fi
+  TRANSACTION=''
+  success '待应用配置已保存并校验。请执行 apply（应用配置并重启）后再导入新节点。'
+}
+
+require_no_pending() {
+  [[ ! -d "$APP/pending" ]] || die '存在待应用配置，请先 apply 或 discard-pending，再执行此操作。'
+}
+
+apply_changes() {
+  need_root
+  local pending="$APP/pending" old_vless old_hy2 old_anytls name
+  [[ -f "$pending/config.json" ]] || die '没有待应用配置。'
+  [[ -f "$pending/base.sha256" ]] || die '待应用配置缺少原配置校验信息，请先丢弃后重新编辑。'
+  [[ "$(sha256sum "$CONFIG" | cut -d ' ' -f1)" == "$(cat "$pending/base.sha256")" ]] || die '已应用配置在暂存后被其他操作修改，拒绝覆盖；请先导出并丢弃待应用修改。'
+  (APP="$pending" CONFIG="$pending/config.json" STAGING=1; check_configuration)
+  load_node_settings
+  old_vless="$VLESS_PORT" old_hy2="$HY2_PORT" old_anytls="$ANYTLS_PORT"
+  begin_transaction update "$CONFIG" "$APP/tls" "$APP/client" "$APP/hopping.json" "$APP/firewall-owned.json" "$APP/manager.sh" "$MANAGER" "$HOP_UNIT_FILE" "$APP/runtime-state.json"
+  snapshot_hopping
+  # Stop the old hopping runtime before replacing its metadata.
+  if [[ -f "$pending/hopping.json" ]]; then cp "$pending/hopping.json" "$TEMP/hopping-plan.json"; fi
+  for name in tls client; do rm -rf "$APP/$name"; cp -a "$pending/$name" "$APP/$name"; done
+  install -m 0600 "$pending/config.json" "$CONFIG"
+  relocate_tls_paths "$CONFIG" "$pending" "$APP"
+  check_configuration
+  install_manager
+  if [[ -f "$TEMP/hopping-plan.json" ]]; then apply_hopping_plan; fi
+  load_node_settings
+  open_firewall "$old_vless" "$old_hy2" "$old_anytls"
+  restart_checked
+  update_firewall_ownership "$old_vless" "$old_hy2" "$old_anytls"
+  node_config export
+  show_node_details
+  TRANSACTION=''
+  rm -rf -- "$pending"
+  success '待应用配置已应用，服务已重启。请重新导入变更的节点。'
+}
+
+discard_pending() {
+  need_root
+  [[ -d "$APP/pending" ]] || die '没有待应用配置。'
+  local answer="${DISCARD_CONFIRM:-}"
+  if [[ -t 0 ]]; then read -r -p '丢弃全部待应用修改？输入 YES：' answer; fi
+  [[ "$answer" == YES ]] || die '未确认，已保留待应用配置。'
+  rm -rf -- "$APP/pending"
+  success '已丢弃待应用修改，运行配置未改变。'
+}
+
+record_runtime_state() {
+  local identity version
+  if ! identity="$(systemctl show "$UNIT" -p InvocationID --value)" || [[ -z "$identity" ]]; then
+    warn '无法取得服务进程标识，暂不能确认运行配置快照。'
+    return 0
+  fi
+  version="$("$BIN" version | sed -n '1s/.*version //p')"
+  node_config record-runtime "$identity" "${version:-未知}"
+}
+
+show_dashboard() {
+  need_root
+  local identity='' snapshot='' version='' pid='' active=0
+  if systemctl is-active --quiet "$UNIT"; then active=1; fi
+  if (( active )) && identity="$(systemctl show "$UNIT" -p InvocationID --value)" && [[ -n "$identity" ]] && snapshot="$(node_config running-summary "$identity")"; then
+    ui success "${snapshot%%$'\n'*}"
+    printf '%s\n' "${snapshot#*$'\n'}"
+  else
+    if (( active )) && pid="$(systemctl show "$UNIT" -p MainPID --value)" && [[ "$pid" =~ ^[1-9][0-9]*$ && -x "/proc/$pid/exe" ]]; then
+      version="$("/proc/$pid/exe" version | sed -n '1s/.*version //p')"
+      ui success "服务：运行中    版本：${version:-未知}"
+    else
+      if [[ -x "$BIN" ]]; then version="$("$BIN" version | sed -n '1s/.*version //p')"; fi
+      if (( active )); then ui success "服务：运行中    已安装版本：${version:-未知}"
+      else ui warning "服务：已停止或异常    已安装版本：${version:-未安装}"; fi
+    fi
+    if [[ -f "$CONFIG" ]]; then
+      if (( active )); then ui warning '运行配置未确认；以下为已保存的配置文件（通过本工具启动或应用后可确认）。'
+      else ui title '已保存配置：'; fi
+      node_config summary
+    else
+      ui warning '尚未安装节点。'
+    fi
+  fi
+  if [[ -f "$APP/pending/config.json" ]]; then
+    ui warning '待应用配置（尚未生效）：'
+    (CONFIG="$APP/pending/config.json"; APP="$APP/pending"; node_config summary)
+    ui warning '执行 apply 应用并重启；执行 discard-pending 丢弃修改。'
+  fi
+}
+
 node_config() {
-  export APP CONFIG
+  export APP CONFIG DEFAULT_HY2_HOP_INTERVAL
   python3 - "$@" <<'PYCODE'
 import copy, hashlib, ipaddress, json, math, os, pathlib, re, ssl, sys, tempfile, uuid
 p = pathlib.Path(os.environ['CONFIG'])
 app = pathlib.Path(os.environ['APP'])
 action = sys.argv[1]
+if action=='running-summary':
+    state_path = app/'runtime-state.json'
+    if not state_path.exists(): sys.exit(1)
+    state = json.loads(state_path.read_text())
+    if not sys.argv[2] or state.get('identity')!=sys.argv[2]: sys.exit(1)
+    print('服务：运行中    版本：'+state['version'])
+    print(state['summary'])
+    sys.exit()
 c = json.loads(p.read_text())
 original = copy.deepcopy(c) if action == 'validate' else None
 
@@ -1000,6 +1180,53 @@ def atomic(path, text):
 
 def write_json(path, obj):
     atomic(path, json.dumps(obj, indent=2, ensure_ascii=False) + '\n')
+
+if action in ('summary','record-runtime','protocols'):
+    labels = {'vless':'VLESS','hysteria2':'Hysteria2','anytls':'AnyTLS'}
+    if action=='protocols':
+        for item in c.get('inbounds',[]):
+            kind=item.get('type')
+            if kind in labels: sys.stdout.write(kind+'\0'+labels[kind]+'\0')
+        sys.exit()
+    transports = {'vless':'TCP','hysteria2':'UDP','anytls':'TCP'}
+    lines = []
+    ports = []
+    for item in c.get('inbounds',[]):
+        kind = item.get('type',item.get('tag','未知协议'))
+        label = labels.get(kind,item.get('tag',kind))
+        network = item.get('network') or transports.get(kind,'端口')
+        if 'listen_port' in item: ports.append(f"{label}：{network.upper()} {item['listen_port']}")
+    lines.append('    '.join(ports) or '未配置监听协议')
+    for item in c.get('inbounds',[]):
+        if item.get('type')=='hysteria2' and 'bbr_profile' in item: lines.append('Hysteria2 BBR：'+item['bbr_profile'])
+    hop_path = app/'hopping.json'
+    if hop_path.exists():
+        hop = json.loads(hop_path.read_text())
+        if hop.get('enabled'): lines.append('HY2 跳跃：'+','.join(hop['ports'])+'，间隔 '+hop['hop_interval'])
+    outbounds = {o.get('tag'):o for o in c.get('outbounds',[])}
+    route = c.get('route',{})
+    groups = []
+    for rule in route.get('rules',[]):
+        if rule.get('action')!='route' or not rule.get('outbound'): continue
+        sets = rule.get('rule_set',[])
+        if isinstance(sets,str): sets=[sets]
+        label = 'Google' if set(sets)&{'google','youtube'} else 'AI' if 'ai' in sets else ' / '.join(sets) or '条件规则'
+        groups.append((label,rule['outbound']))
+    groups.append(('其他',route.get('final','未指定')))
+    if [label for label,_ in groups]==['Google','AI','其他'] and all(outbounds.get(tag,{}).get('type')=='socks' for _,tag in groups):
+        profiles = {(outbounds[tag].get('server'),outbounds[tag].get('server_port'),outbounds[tag].get('username'),outbounds[tag].get('password')) for _,tag in groups}
+        count = len(profiles)
+        lines.append('分流：Google / AI / 其他 → '+(f'{count} 组独立 SOCKS5' if count==len(groups) else f'共用 {count} 组 SOCKS5'))
+    for label,tag in groups:
+        outbound = outbounds.get(tag,{})
+        endpoint = f"SOCKS5 {outbound.get('server','?')}:{outbound.get('server_port','?')}" if outbound.get('type')=='socks' else str(tag)
+        lines.append(f'{label} → {endpoint}')
+    summary_text = '\n'.join(lines)
+    if action=='record-runtime':
+        atomic(app/'runtime-state.json',json.dumps({'identity':sys.argv[2],'version':sys.argv[3],'summary':summary_text},ensure_ascii=False)+'\n')
+    else:
+        print(summary_text)
+    sys.exit()
 
 if action == 'socks':
     found = [o for o in c['outbounds'] if o.get('tag') == sys.argv[2] + '-socks' and o.get('type') == 'socks']
@@ -1033,15 +1260,6 @@ if hop.get('enabled'):
     if hop.get('version') != 1 or hop.get('base_port') != (int(os.environ['HY2_PORT']) if action=='update' and len(sys.argv)>2 and sys.argv[2]=='ports' else h['listen_port']) or not isinstance(hop.get('ports'),list) or not hop['ports']:
         sys.exit('跳跃配置与 HY2 监听端口不一致。')
 
-if action == 'summary':
-    print(f"VLESS：TCP {v['listen_port']}    Hysteria2：UDP {h['listen_port']}")
-    if a: print(f"AnyTLS：TCP {a['listen_port']}")
-    if hop.get('enabled'): print('HY2 跳跃：'+','.join(hop['ports'])+'，间隔 '+hop['hop_interval'])
-    for tag, label in [('google-socks','Google/YouTube'), ('ai-socks','其余 AI'), (c['route'].get('final'),'其他流量')]:
-        outbound = next((o for o in c['outbounds'] if o.get('tag') == tag), {})
-        address = f"{outbound.get('server', '')}:{outbound.get('server_port', '')}" if outbound.get('type') == 'socks' else str(tag)
-        print(f'{label} → {address}')
-    sys.exit()
 
 if action == 'load':
     values = {
@@ -1051,9 +1269,10 @@ if action == 'load':
         'ANYTLS_PASS': a['users'][0]['password'] if a else '',
         'UUID': v['users'][0]['uuid'], 'REALITY_DOMAIN': v['tls']['reality']['handshake']['server'],
         'HY2_SNI': h['tls'].get('server_name') or hc['tls']['server_name'],
+        'HY2_BBR_CURRENT': h.get('bbr_profile',''),
         'HY2_PASS': h['users'][0]['password'], 'HY2_OBFS_PASS': h.get('obfs', {}).get('password', ''),
         'HY2_HOP_PORTS': ','.join(hop['ports']) if hop.get('enabled') else '',
-        'HY2_HOP_INTERVAL': hop.get('hop_interval','30s'),
+        'HY2_HOP_INTERVAL': hop.get('hop_interval',os.environ['DEFAULT_HY2_HOP_INTERVAL']),
     }
     for key, value in values.items():
         sys.stdout.write(key + '\0' + str(value) + '\0')
@@ -1117,6 +1336,10 @@ if action in ('update', 'validate'):
                     sys.exit('证书由外部路径管理，拒绝重新生成；请先手动处理证书。')
             target['users'][0]['password'] = password
             if stem == 'hy2': h['obfs'] = {'type':'salamander','password':e['HY2_OBFS_PASS']}
+    elif mode == 'bbr':
+        if e['HY2_BBR_PROFILE'] not in ('standard','conservative','aggressive'):
+            sys.exit('BBR 档位必须是 standard、conservative 或 aggressive。')
+        h['bbr_profile'] = e['HY2_BBR_PROFILE']
     elif mode == 'tfo':
         if e['SOCKS_TFO'] not in ('true', 'false'):
             sys.exit('TFO 只能设置为 true 或 false。')
@@ -1246,6 +1469,7 @@ VLESS URI: {vless_uri}
 云安全组需开放上述客户端 UDP 端口。
 Password: {hc['password']}
 TLS SNI: {hc['tls']['server_name']}
+BBR profile: {h.get('bbr_profile','standard')}
 Obfuscation: {hc.get('obfs', {}).get('type', 'none')}
 Obfuscation password: {hc.get('obfs', {}).get('password', 'not configured')}
 Hysteria2 URI: {hy2_uri}
@@ -1301,14 +1525,15 @@ load_node_settings() {
   local -a settings=()
   local index
   mapfile -d '' -t settings < <(node_config load)
-  [[ ${#settings[@]} == 25 && "${settings[24]}" == READY ]] || die '无法读取已有节点配置。'
-  for ((index=0; index<24; index+=2)); do
+  [[ ${#settings[@]} == 27 && "${settings[26]}" == READY ]] || die '无法读取已有节点配置。'
+  for ((index=0; index<26; index+=2)); do
     printf -v "${settings[index]}" '%s' "${settings[index+1]}"
     export "${settings[index]}"
   done
 }
 
 restart_checked() {
+  [[ ${STAGING:-0} != 1 ]] || return 0
   systemctl restart "$UNIT"
   sleep 2
   if ! systemctl is-active --quiet "$UNIT"; then
@@ -1323,6 +1548,7 @@ restart_checked() {
     tcp="$(ss -H -ltnp "( sport = :$ANYTLS_PORT )")"
     [[ "$tcp" == *'"sing-box"'* ]] || die "服务未监听 AnyTLS TCP/$ANYTLS_PORT。"
   fi
+  record_runtime_state
 }
 
 set_node() {
@@ -1334,9 +1560,17 @@ set_node() {
   if [[ "$mode" == regenerate ]]; then
     local protocol="${2:-}"
     if [[ -z "$protocol" && -t 0 ]]; then
-      menu_choices '\n重新生成指定协议配置（端口和 SNI 保持不变）\n 1. VLESS Reality\n 2. Hysteria2\n 3. AnyTLS\n 0. 返回\n'
+      local -a protocols=()
+      local index
+      mapfile -d '' -t protocols < <(node_config protocols)
+      (( ${#protocols[@]} > 0 && ${#protocols[@]} % 2 == 0 )) || die '没有可重新生成的协议。'
+      ui warning '重新生成指定协议配置（端口和 SNI 保持不变）'
+      for ((index=0; index<${#protocols[@]}; index+=2)); do ui item " $((index/2+1)). ${protocols[index+1]}"; done
+      ui item ' 0. 返回'
       read -r -p '请选择：' answer || return 0
-      case "$answer" in 1) protocol=vless ;; 2) protocol=hysteria2 ;; 3) protocol=anytls ;; 0) return 0 ;; *) die '无效选择。' ;; esac
+      [[ "$answer" != 0 ]] || return 0
+      [[ "$answer" =~ ^[0-9]{1,2}$ ]] && ((10#$answer>=1 && 10#$answer<=${#protocols[@]}/2)) || die '无效选择。'
+      protocol="${protocols[(10#$answer-1)*2]}"
     fi
     case "$protocol" in
       vless|hysteria2) ;;
@@ -1364,7 +1598,7 @@ set_node() {
       fi
       local occupied
       occupied="$(ss -H -ltn "( sport = :$ANYTLS_PORT )")"
-      [[ -z "$occupied" ]] || die "TCP/$ANYTLS_PORT 已被占用。" ;;
+      [[ -z "$occupied" || ${STAGING:-0} == 1 ]] || die "TCP/$ANYTLS_PORT 已被占用。" ;;
     ports)
       VLESS_PORT="${requested_vless:-$VLESS_PORT}"; HY2_PORT="${requested_hy2:-$HY2_PORT}"
       if [[ -n "$ANYTLS_PORT" ]]; then ANYTLS_PORT="${requested_anytls:-$ANYTLS_PORT}"; fi
@@ -1372,15 +1606,15 @@ set_node() {
       local occupied
       if [[ "$VLESS_PORT" != "$old_vless" ]]; then
         occupied="$(ss -H -ltn "( sport = :$VLESS_PORT )")"
-        [[ -z "$occupied" ]] || die "TCP/$VLESS_PORT 已被占用。"
+        [[ -z "$occupied" || ${STAGING:-0} == 1 ]] || die "TCP/$VLESS_PORT 已被占用。"
       fi
       if [[ "$HY2_PORT" != "$old_hy2" ]]; then
         occupied="$(ss -H -lun "( sport = :$HY2_PORT )")"
-        [[ -z "$occupied" ]] || die "UDP/$HY2_PORT 已被占用。"
+        [[ -z "$occupied" || ${STAGING:-0} == 1 ]] || die "UDP/$HY2_PORT 已被占用。"
       fi
       if [[ -n "$ANYTLS_PORT" && "$ANYTLS_PORT" != "$old_anytls" ]]; then
         occupied="$(ss -H -ltn "( sport = :$ANYTLS_PORT )")"
-        [[ -z "$occupied" ]] || die "TCP/$ANYTLS_PORT 已被占用。"
+        [[ -z "$occupied" || ${STAGING:-0} == 1 ]] || die "TCP/$ANYTLS_PORT 已被占用。"
       fi ;;
     sni)
       REALITY_DOMAIN="${NEW_REALITY_DOMAIN:-$REALITY_DOMAIN}"; HY2_SNI="${NEW_HY2_SNI:-$HY2_SNI}"
@@ -1409,6 +1643,12 @@ set_node() {
         [[ "$answer" == YES ]] || return 0
       fi
       new_credentials ;;
+    bbr)
+      HY2_BBR_PROFILE="${HY2_BBR_PROFILE_REQUEST:-${HY2_BBR_CURRENT:-$DEFAULT_HY2_BBR_PROFILE}}"
+      if [[ -t 0 ]]; then
+        read -r -p "HY2 BBR 档位：standard / conservative / aggressive [$HY2_BBR_PROFILE]：" answer
+        HY2_BBR_PROFILE="${answer:-$HY2_BBR_PROFILE}"
+      fi ;;
     tfo)
       if [[ -t 0 ]]; then
         read -r -p '三组 SOCKS5 的 TFO：1 开启，2 关闭，0 返回：' answer
@@ -1416,11 +1656,11 @@ set_node() {
       fi ;;
     *) die '未知节点修改操作。' ;;
   esac
-  export VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS REALITY_DOMAIN HY2_SNI UUID HY2_PASS HY2_OBFS_PASS SOCKS_TFO
+  export VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS REALITY_DOMAIN HY2_SNI UUID HY2_PASS HY2_OBFS_PASS HY2_BBR_PROFILE SOCKS_TFO
   local validation
   validation="$(node_config validate "$mode")"
   if [[ "$validation" == unchanged ]]; then log '设置没有变化，已保留现有配置。'; return 0; fi
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   begin_transaction update "$CONFIG" "$APP/client" "$APP/tls" "$APP/firewall-owned.json" "$APP/hopping.json" "$HOP_UNIT_FILE"
   if [[ "$mode" == sni ]]; then
     [[ "$REALITY_DOMAIN" == "$old_reality" ]] || check_reality_target
@@ -1441,7 +1681,7 @@ PYCODE
     apply_hopping_plan
   fi
   node_config update "$mode"
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   if [[ "$mode" == ports || "$mode" == add-anytls ]]; then open_firewall "$old_vless" "$old_hy2" "$old_anytls"; fi
   restart_checked
   if [[ "$mode" == ports || "$mode" == add-anytls ]]; then
@@ -1451,7 +1691,7 @@ PYCODE
   TRANSACTION=""
   forget_socks
   unset REALITY_PRIVATE HY2_PASS HY2_OBFS_PASS ANYTLS_PASS
-  success '配置、客户端资料和服务已同步更新。请重新导入有变化的节点。'
+  if [[ ${STAGING:-0} != 1 ]]; then success '配置、客户端资料和服务已同步更新。请重新导入有变化的节点。'; fi
 }
 
 export_nodes() {
@@ -1466,6 +1706,7 @@ export_nodes() {
 
 # Persist ownership so later port edits never remove an administrator's permits.
 update_firewall_ownership() {
+  [[ ${STAGING:-0} != 1 ]] || return 0
   FW_RESTORE="$TEMP/firewall-restore.json"
   export APP TEMP FW_MARK FW_NFT FW_RESTORE VLESS_PORT HY2_PORT ANYTLS_PORT
   python3 - "$@" <<'PYCODE'
@@ -1677,7 +1918,7 @@ PYCODE
   journalctl -u "$UNIT" -n 20 --no-pager || result=1
   printf '\n=== Config check ===\n'
   if [[ -x "$BIN" && -f "$CONFIG" ]]; then
-    "$BIN" check -C /etc/sing-box || result=1
+    check_configuration || result=1
   else
     log 'sing-box binary or configuration is missing.'
     result=1
@@ -1696,6 +1937,7 @@ PYCODE
 }
 
 install_manager() {
+  [[ ${STAGING:-0} != 1 ]] || return 0
   [[ ! -L "$MANAGER" ]] || die '管理入口是符号链接，拒绝覆盖。'
   if [[ -e "$MANAGER" ]]; then
     grep -qxF '# sing-box-deploy 管理入口' "$MANAGER" || die '该管理命令不属于本脚本，拒绝覆盖。'
@@ -1721,8 +1963,15 @@ setup_manager() {
 service_cmd() {
   need_root
   case "$1" in
-    restart) load_node_settings; restart_checked ;;
-    start) systemctl start "$UNIT"; systemctl is-active --quiet "$UNIT" ;;
+    restart) require_no_pending; load_node_settings; restart_checked ;;
+    start)
+      require_no_pending
+      if ! systemctl is-active --quiet "$UNIT"; then
+        load_node_settings
+        systemctl start "$UNIT"
+        systemctl is-active --quiet "$UNIT"
+        record_runtime_state
+      fi ;;
     stop) systemctl stop "$UNIT" ;;
   esac
   log "服务操作完成：$1"
@@ -1730,7 +1979,7 @@ service_cmd() {
 
 check_connections() {
   need_root
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   load_node_settings
   local profile prefix
   local -a values=()
@@ -1760,77 +2009,72 @@ menu_action() {
   read -r -p '按回车返回菜单。' answer || return 0
 }
 
-protocol_menu() {
-  local choice
+# Labels and actions share one list; numbering and dispatch follow that list.
+run_menu() {
+  local title="$1" header="$2" choice action index text count
+  shift 2
+  local -a entries=("$@")
+  count=$((${#entries[@]}/2))
   while true; do
-    menu_choices '\n协议配置\n 1. 修改监听端口\n 2. 修改 Reality / Hysteria2 / AnyTLS SNI\n 3. 修改 UUID、HY2 认证/混淆及 AnyTLS 密码\n 4. 重新生成全部节点凭据（旧节点失效）\n 5. 三组 SOCKS5 的 TFO 开关\n 6. Hysteria2 端口跳跃与占用端口排除\n 7. 为旧部署添加 AnyTLS\n 8. 重新生成指定协议配置\n 0. 返回\n'
+    printf '\n'; ui title "$title"
+    if [[ -n "$header" ]] && ! bash "$SCRIPT_PATH" "$header"; then ui warning '配置摘要读取失败，请查看状态和日志。'; fi
+    text=''
+    for ((index=0; index<${#entries[@]}; index+=2)); do
+      text+=" $((index/2+1)). ${entries[index]}"$'\n'
+    done
+    text+=' 0. 返回 / 退出'
+    menu_choices "$text"
     read -r -p '请选择：' choice || return 0
-    case "$choice" in
-      1) menu_action set-ports ;;
-      2) menu_action set-sni ;;
-      3) menu_action set-credentials ;;
-      4) menu_action rotate-credentials ;;
-      5) menu_action set-tfo ;;
-      6) menu_action set-hopping ;;
-      7) menu_action add-anytls ;;
-      8) menu_action regenerate ;;
-      0) return 0 ;;
-      *) ui warning '无效选择，请重新输入。' ;;
-    esac
+    [[ "$choice" != 0 ]] || return 0
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( ${#choice}>${#count} || 10#$choice<1 || 10#$choice>count )); then
+      ui warning '无效选择，请重新输入。'
+      continue
+    fi
+    action="${entries[(10#$choice-1)*2+1]}"
+    if [[ "$action" == @* ]]; then "${action#@}"
+    else menu_action "$action"; fi
   done
+}
+
+protocol_menu() {
+  run_menu '协议配置' '' \
+    '修改监听端口' set-ports \
+    '修改协议 SNI' set-sni \
+    '修改协议凭据' set-credentials \
+    '重新生成全部节点凭据（旧节点失效）' rotate-credentials \
+    '三组 SOCKS5 的 TFO 开关' set-tfo \
+    'Hysteria2 端口跳跃与占用端口排除' set-hopping \
+    '为旧部署添加 AnyTLS' add-anytls \
+    '重新生成指定协议配置' regenerate \
+    'Hysteria2 BBR 拥塞控制档位' set-hy2-bbr
 }
 
 socks_menu() {
-  local choice
-  while true; do
-    menu_choices '\nSOCKS5 出口\n 1. AI\n 2. Google / YouTube\n 3. 其他流量\n 4. 同时修改三组\n 0. 返回\n'
-    read -r -p '请选择：' choice || return 0
-    case "$choice" in
-      1) menu_action set-ai-socks ;;
-      2) menu_action set-google-socks ;;
-      3) menu_action set-other-socks ;;
-      4) menu_action configure-socks ;;
-      0) return 0 ;;
-      *) ui warning '无效选择，请重新输入。' ;;
-    esac
-  done
+  run_menu 'SOCKS5 出口' '' \
+    'AI' set-ai-socks \
+    'Google / YouTube' set-google-socks \
+    '其他流量' set-other-socks \
+    '同时修改三组' configure-socks
 }
 
 export_menu() {
-  local choice
-  while true; do
-    menu_choices '\n节点资料（含访问凭据）\n 1. 查看连接参数和分享链接\n 2. 查看客户端 JSON\n 3. 导出到节点资料目录\n 4. 查看 Clash/Mihomo proxies YAML\n 5. 可选导出 proxies.yaml 文件\n 0. 返回\n'
-    read -r -p '请选择：' choice || return 0
-    case "$choice" in
-      1) menu_action show ;;
-      2) menu_action show-json ;;
-      3) menu_action export ;;
-      4) menu_action show-yaml ;;
-      5) menu_action export-yaml ;;
-      0) return 0 ;;
-      *) ui warning '无效选择，请重新输入。' ;;
-    esac
-  done
+  run_menu '节点资料（含访问凭据）' '' \
+    '查看已应用的连接参数和分享链接' show \
+    '查看已应用的客户端 JSON' show-json \
+    '导出已应用节点到资料目录' export \
+    '查看已应用的 Clash/Mihomo proxies YAML' show-yaml \
+    '可选导出已应用的 proxies.yaml 文件' export-yaml
 }
 
 service_menu() {
-  local choice
-  menu_choices '\n服务管理\n 1. 启动\n 2. 停止\n 3. 重启\n 0. 返回\n'
-  read -r -p '请选择：' choice || return 0
-  case "$choice" in
-    1) menu_action start ;;
-    2) menu_action stop ;;
-    3) menu_action restart ;;
-    0) return 0 ;;
-    *) ui warning '无效选择。' ;;
-  esac
+  run_menu '服务管理' '' '启动' start '停止' stop '重启' restart
 }
 
 # Port hopping is UDP REDIRECT into the same QUIC listener, never separate inbounds.
 prepare_hopping() {
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
   local spec_input exclusion_input interval_input
-  local occupied exclusion="${HY2_HOP_EXCLUDE:-auto}" spec="${HY2_HOP_PORTS:-}" interval="${HY2_HOP_INTERVAL:-30s}" backend
+  local occupied exclusion="${HY2_HOP_EXCLUDE:-auto}" spec="${HY2_HOP_PORTS:-}" interval="${HY2_HOP_INTERVAL:-$DEFAULT_HY2_HOP_INTERVAL}" backend
   occupied="$(ss -H -lntup)"
   printf '%s\n' "$occupied" > "$TEMP/occupied.txt"
   if [[ -t 0 ]]; then
@@ -1903,6 +2147,7 @@ PYCODE
 }
 
 snapshot_hopping() {
+  [[ ${STAGING:-0} != 1 ]] || return 0
   if [[ -f "$HOP_UNIT_FILE" ]]; then
     grep -qxF 'Description=sing-box owned HY2 port hopping' "$HOP_UNIT_FILE" || die '同名跳跃服务不属于本脚本，拒绝覆盖。'
   elif systemctl cat "$HOP_UNIT" >/dev/null 2>&1; then
@@ -1914,6 +2159,10 @@ snapshot_hopping() {
 }
 
 apply_hopping_plan() {
+  if [[ ${STAGING:-0} == 1 ]]; then
+    install -m 0600 "$TEMP/hopping-plan.json" "$APP/hopping.json"
+    return 0
+  fi
   # Stop with the old metadata before replacing the redirect target.
   if [[ -f "$APP/hopping.json" ]]; then
     hopping_runtime stop
@@ -2020,7 +2269,7 @@ set_hopping() {
   HY2_HOP_PORTS="${requested:-$HY2_HOP_PORTS}"; HY2_HOP_INTERVAL="${interval:-$HY2_HOP_INTERVAL}"
   prepare_hopping
   hopping_runtime validate "$TEMP/hopping-plan.json"
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   begin_transaction update "$APP/client" "$APP/hopping.json" "$APP/manager.sh" "$MANAGER" "$HOP_UNIT_FILE"
   snapshot_hopping
   install_manager
@@ -2029,7 +2278,7 @@ set_hopping() {
   restart_checked
   show_node_details
   TRANSACTION=""
-  success '端口跳跃已更新；请重新导入客户端配置，并在云安全组开放上面列出的 UDP 跳跃端口。'
+  if [[ ${STAGING:-0} != 1 ]]; then success '端口跳跃已更新；请重新导入客户端配置，并在云安全组开放上面列出的 UDP 跳跃端口。'; fi
 }
 
 package_is_installed() {
@@ -2116,7 +2365,7 @@ kernel_update() {
   check_os
   [[ -x "$BIN" && -f "$CONFIG" ]] || die '请先安装。'
   load_node_settings
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   begin_transaction update /etc/sing-box "$APP/client" "$APP/tls" "$APP/rules"
   prepare_package_rollback
   systemctl stop "$UNIT"
@@ -2134,7 +2383,7 @@ kernel_update() {
   fi
   systemctl daemon-reload
   "$BIN" version
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   # Package scripts must not silently replace node credentials or configuration.
   cmp -s "$CONFIG" "$TEMP/0/config.json" || die '软件包更新改动了配置，正在恢复原版本。'
   if (( WAS_ACTIVE )); then restart_checked; else systemctl stop "$UNIT"; fi
@@ -2247,6 +2496,7 @@ PYCODE
 
 backup_cmd() {
   need_root
+  if [[ -d "$APP/pending" ]]; then warn '本次备份仅包含已应用配置，待应用修改未纳入备份。'; fi
   [[ -f "$CONFIG" && -d "$APP/client" ]] || die '没有可备份的节点配置。'
   local target="${1:-${BACKUP_FILE:-}}" version
   if [[ -x "$BIN" ]] && version="$("$BIN" version 2>/dev/null)" && [[ -n "$version" ]]; then
@@ -2265,6 +2515,7 @@ backup_cmd() {
 
 restore_backup() {
   need_root
+  require_no_pending
   [[ -x "$BIN" ]] || die '请先安装兼容的 sing-box 内核，再恢复配置。'
   local source="${1:-${BACKUP_FILE:-}}" old_vless="" old_hy2="" old_anytls="" answer
   if [[ -z "$source" && -t 0 ]]; then
@@ -2315,7 +2566,12 @@ PYCODE
   if [[ -f "$TEMP/restored/hopping.json" ]]; then
     cp "$TEMP/restored/hopping.json" "$TEMP/hopping-plan.json"
   else
-    printf '{"version":1,"enabled":false,"backend":"nft","base_port":443,"ports":[],"hop_interval":"30s"}\n' > "$TEMP/hopping-plan.json"
+    python3 - "$CONFIG" "$TEMP/hopping-plan.json" "$DEFAULT_HY2_HOP_INTERVAL" <<'PYCODE'
+import json,pathlib,sys
+config=json.loads(pathlib.Path(sys.argv[1]).read_text())
+port=next(i['listen_port'] for i in config['inbounds'] if i.get('tag')=='hysteria2')
+pathlib.Path(sys.argv[2]).write_text(json.dumps({'version':1,'enabled':False,'backend':'nft','base_port':port,'ports':[],'hop_interval':sys.argv[3]})+'\n')
+PYCODE
   fi
   # Old runtime has already been stopped; plan applies the restored redirect target.
   rm -f "$APP/hopping.json"
@@ -2323,7 +2579,7 @@ PYCODE
   apply_hopping_plan
   node_config export
   load_node_settings
-  "$BIN" check -C /etc/sing-box
+  check_configuration
   rm -f "$APP/cache.db"
   open_firewall "$old_vless" "$old_hy2" "$old_anytls"
   if [[ "$restore_active" == yes ]]; then restart_checked; else systemctl stop "$UNIT"; fi
@@ -2336,6 +2592,7 @@ PYCODE
 
 uninstall_cmd() {
   need_root
+  require_no_pending
   check_os
   [[ -d "$APP/client" && -f "$CONFIG" ]] || die '没有可确认的本脚本部署。'
   if [[ -e "$MANAGER" ]]; then
@@ -2382,66 +2639,56 @@ uninstall_cmd() {
 main_menu() {
   need_root
   [[ -t 0 ]] || { usage; return 0; }
-  local choice
-  while true; do
-    printf '\n'; ui title '━━━━━━━━━━ sing-box 管理工具 ━━━━━━━━━━'
-    if [[ -f "$CONFIG" ]]; then
-      if systemctl is-active --quiet "$UNIT"; then ui success '● 服务：运行中'; else ui warning '● 服务：已停止或异常'; fi
-      if ! bash "$SCRIPT_PATH" summary; then ui warning '节点资料读取失败，请查看状态和日志。'; fi
-    else
-      ui warning '尚未安装节点。'
-    fi
-    menu_choices '\n 1. 安装\n 2. 修改协议配置\n 3. 修改 SOCKS5 出口\n 4. 查看 / 导出节点\n 5. 启动 / 停止 / 重启服务\n 6. 查看状态\n 7. 查看日志\n 8. 检查连接\n 9. 安装 / 更新快捷命令 sb-manager\n10. 更新 sing-box 内核\n11. 手动备份配置\n12. 恢复配置备份\n13. 卸载\n 0. 退出\n'
-    read -r -p '请选择：' choice || return 0
-    case "$choice" in
-      1) menu_action install ;;
-      2) protocol_menu ;;
-      3) socks_menu ;;
-      4) export_menu ;;
-      5) service_menu ;;
-      6) menu_action status ;;
-      7) menu_action logs ;;
-      8) menu_action check ;;
-      9) menu_action setup-manager ;;
-      10) menu_action update ;;
-      11) menu_action backup ;;
-      12) menu_action restore ;;
-      13) menu_action uninstall ;;
-      0) return 0 ;;
-      *) ui warning '无效选择，请重新输入。' ;;
-    esac
-  done
+  run_menu '━━━━━━━━━━ sing-box 管理工具 ━━━━━━━━━━' summary \
+    '安装' install \
+    '修改协议配置' @protocol_menu \
+    '修改 SOCKS5 出口' @socks_menu \
+    '查看 / 导出节点' @export_menu \
+    '启动 / 停止 / 重启服务' @service_menu \
+    '查看状态' status \
+    '查看日志' logs \
+    '检查连接' check \
+    '安装 / 更新快捷命令 sb-manager' setup-manager \
+    '更新 sing-box 内核' update \
+    '手动备份已应用配置' backup \
+    '恢复配置备份' restore \
+    '卸载' uninstall \
+    '应用配置并重启' apply \
+    '丢弃待应用修改' discard-pending
 }
 
 case "${1:-menu}" in
   menu) main_menu ;;
   install) fresh_install ;;
-  set-ports) set_node ports ;;
-  set-hopping) set_hopping ;;
+  set-ports) stage_changes set_node ports ;;
+  set-hopping) stage_changes set_hopping ;;
+  set-hy2-bbr) stage_changes set_node bbr ;;
   update) kernel_update ;;
   backup) backup_cmd "${2:-}" ;;
   restore) restore_backup "${2:-}" ;;
   uninstall) uninstall_cmd ;;
   hopping-runtime) hopping_runtime "${2:-validate}" ;;
-  set-sni) set_node sni ;;
-  set-credentials) set_node credentials ;;
-  rotate-credentials) set_node rotate ;;
-  regenerate) set_node regenerate "${2:-}" ;;
-  set-tfo) set_node tfo ;;
+  set-sni) stage_changes set_node sni ;;
+  set-credentials) stage_changes set_node credentials ;;
+  rotate-credentials) stage_changes set_node rotate ;;
+  regenerate) stage_changes set_node regenerate "${2:-}" ;;
+  set-tfo) stage_changes set_node tfo ;;
   export) export_nodes ;;
   show-json) need_root; node_config json ;;
   show-yaml) need_root; node_config yaml ;;
   export-yaml) need_root; node_config export-yaml; success "已导出 $APP/client/proxies.yaml" ;;
-  add-anytls) set_node add-anytls ;;
-  summary) need_root; node_config summary; "$BIN" version | sed -n '1p' ;;
+  add-anytls) stage_changes set_node add-anytls ;;
+  summary) show_dashboard ;;
+  apply) apply_changes ;;
+  discard-pending) discard_pending ;;
   setup-manager) setup_manager ;;
   start|stop|restart) service_cmd "$1" ;;
   logs) need_root; journalctl -u "$UNIT" -n 80 --no-pager ;;
   check) check_connections ;;
-  set-ai-socks|set-socks) set_socks_profile ai ;;
-  set-google-socks) set_socks_profile google ;;
-  set-other-socks) set_socks_profile other ;;
-  configure-socks) set_socks_profile ai google other ;;
+  set-ai-socks|set-socks) stage_changes set_socks_profile ai ;;
+  set-google-socks) stage_changes set_socks_profile google ;;
+  set-other-socks) stage_changes set_socks_profile other ;;
+  configure-socks) stage_changes set_socks_profile ai google other ;;
   status) status_cmd ;;
   show) show_node_details ;;
   -h|--help|help) usage ;;

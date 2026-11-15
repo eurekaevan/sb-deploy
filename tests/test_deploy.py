@@ -359,6 +359,7 @@ show_node_details
         self.assertNotIn('other-secret', result.stdout)
         self.assertIn('else Other SOCKS5.', result.stdout)
         server = config['inbounds'][1]
+        self.assertEqual(server['bbr_profile'],'standard')
         client = json.loads((self.app / 'client/hysteria2.outbound.json').read_text())
         self.assertEqual(client['server_port'], 9443)
         self.assertEqual(server['obfs'], client['obfs'])
@@ -741,6 +742,278 @@ set_node regenerate {protocol}
         new = json.loads(self.config.read_text())
         self.assertEqual(new['inbounds'][:2],old['inbounds'][:2])
         self.assertNotEqual(new['inbounds'][2]['users'],old['inbounds'][2]['users'])
+
+    def test_pending_protocol_edits_do_not_touch_live_files_or_service(self):
+        original = self.managed_node()
+        before = self.file_snapshot()
+        result = self.run_bash('stage_changes set_node add-anytls',ANYTLS_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending = self.app/'pending'
+        current = self.file_snapshot()
+        self.assertEqual({p:data for p,data in current.items() if not p.startswith('deployment/pending/')},before)
+        self.assertFalse((self.root/'service.log').exists())
+        config = json.loads((pending/'config.json').read_text())
+        self.assertEqual([i['type'] for i in config['inbounds']],['vless','hysteria2','anytls'])
+        self.assertTrue(all(i['tls']['certificate_path'].startswith(str(pending)) for i in config['inbounds'][1:]))
+        result = self.run_bash('stage_changes set_node ports',ANYTLS_PORT='10444')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads((pending/'config.json').read_text())['inbounds'][2]['listen_port'],10444)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((pending/'client/proxies.yaml').exists())
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_pending_socks_hopping_and_rotation_wait_for_manual_apply(self):
+        original = self.managed_node(anytls=True)
+        before = self.file_snapshot()
+        self.setup_nat()
+        nat_before = self.nat_state.read_bytes()
+        result = self.run_bash('''read_socks_profile() {
+  export AI_SOCKS_HOST=new-ai AI_SOCKS_PORT=2080 AI_SOCKS_USER=user AI_SOCKS_PASS=new-password
+}
+check_socks() { :; }
+stage_changes set_socks_profile ai
+stage_changes set_node regenerate anytls
+stage_changes set_hopping
+''',HY2_HOP_PORTS='20000:20005',HY2_HOP_INTERVAL='20s')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        after = self.file_snapshot()
+        self.assertEqual({p:data for p,data in after.items() if not p.startswith('deployment/pending/')},before)
+        self.assertEqual(self.nat_state.read_bytes(),nat_before)
+        self.assertFalse((self.root/'service.log').exists())
+        self.assertFalse((self.root/'units/sing-box-hopping.service').exists())
+        config = json.loads((self.app/'pending/config.json').read_text())
+        self.assertEqual(next(o for o in config['outbounds'] if o['tag']=='ai-socks')['server'],'new-ai')
+        self.assertNotEqual(config['inbounds'][2]['users'],original['inbounds'][2]['users'])
+        self.assertEqual(json.loads((self.app/'pending/hopping.json').read_text())['ports'],['20000:20005'])
+
+    def test_pending_save_failure_restores_previous_pending_and_leaves_service_alone(self):
+        self.managed_node(anytls=True)
+        result = self.run_bash('stage_changes set_node credentials',NEW_ANYTLS_PASS='keep-pending')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before = self.file_snapshot()
+        result = self.run_bash('stage_changes set_node credentials',NEW_ANYTLS_PASS='')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),before)
+        (self.root/'fail-check').touch()
+        result = self.run_bash('stage_changes set_node regenerate anytls')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_apply_pending_commits_all_files_and_network_rules_together(self):
+        original = self.managed_node()
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result = self.run_bash('stage_changes set_node add-anytls',ANYTLS_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.firewall_state.read_text())['ufw'],['ALLOW 22/tcp'])
+        result = self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.app/'pending').exists())
+        config = json.loads(self.config.read_text())
+        self.assertEqual(config['inbounds'][:2],original['inbounds'])
+        self.assertEqual(config['inbounds'][2]['tls']['certificate_path'],str(self.app/'tls/anytls.crt'))
+        self.assertTrue((self.app/'client/anytls.outbound.json').exists())
+        self.assertIn('ALLOW 10443/tcp',json.loads(self.firewall_state.read_text())['ufw'])
+        self.assertTrue((self.root/'active').exists())
+        self.assertIn('restart sing-box.service',(self.root/'service.log').read_text())
+
+    def test_apply_failure_restores_live_files_rules_and_keeps_pending(self):
+        self.managed_node()
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        (self.root/'active').touch()
+        result = self.run_bash('stage_changes set_node add-anytls',ANYTLS_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before = self.file_snapshot()
+        (self.root/'fail-restart').touch()
+        result = self.run_bash('apply_changes')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertEqual(json.loads(self.firewall_state.read_text())['ufw'],['ALLOW 22/tcp'])
+        self.assertTrue((self.root/'active').exists())
+
+    def test_apply_pending_hopping_is_the_first_nat_mutation(self):
+        self.managed_node()
+        self.setup_nat()
+        result = self.run_bash('stage_changes set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.root/'hop-active').exists())
+        result = self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.root/'hop-active').exists())
+        self.assertIn(str(self.app/'manager.sh'),(self.root/'units/sing-box-hopping.service').read_text())
+        self.assertNotIn('/pending/',(self.root/'units/sing-box-hopping.service').read_text())
+
+    def test_summary_uses_configuration_without_client_exports_or_fixed_protocols(self):
+        self.config.parent.mkdir(parents=True)
+        config = {'inbounds':[{'type':'anytls','tag':'a','listen_port':23123},
+                              {'type':'custom','tag':'extra','listen_port':24567}],
+                  'outbounds':[{'tag':'custom-out','type':'direct'}],
+                  'route':{'rules':[{'action':'route','rule_set':['custom-set'],'outbound':'custom-out'}],'final':'custom-out'}}
+        self.config.write_text(json.dumps(config))
+        result = self.run_bash('node_config summary')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('AnyTLS：TCP 23123',result.stdout)
+        self.assertIn('extra：端口 24567',result.stdout)
+        self.assertIn('custom-set → custom-out',result.stdout)
+        self.assertNotIn('VLESS',result.stdout)
+        self.assertNotIn('独立 SOCKS5',result.stdout)
+
+    def test_dashboard_distinguishes_process_bound_running_state_and_pending(self):
+        self.managed_node()
+        self.bin.write_text(self.bin.read_text().replace('elif [[ $1 == generate ]]',
+            "elif [[ $1 == version ]]; then echo 'sing-box version 1.14.77'\nelif [[ $1 == generate ]]"))
+        self.prelude = self.prelude.replace('  case "$1" in\n    cat)',
+            '  case "$1" in\n    show) echo "${TEST_SERVICE_ID:-instance-one}" ;;\n    cat)',1)
+        (self.root/'active').touch()
+        result = self.run_bash('record_runtime_state\nstage_changes set_node add-anytls\nshow_dashboard',ANYTLS_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        dashboard = result.stdout[result.stdout.index('服务：运行中'):]
+        self.assertIn('版本：1.14.77',dashboard)
+        running,pending = dashboard.split('待应用配置（尚未生效）：')
+        self.assertIn('VLESS：TCP 8443    Hysteria2：UDP 9443',running)
+        self.assertIn('3 组独立 SOCKS5',running)
+        self.assertNotIn('AnyTLS',running)
+        self.assertIn('AnyTLS：TCP 10443',pending)
+        self.assertNotIn('ai-secret',dashboard)
+        self.assertNotIn('google-secret',dashboard)
+        result = self.run_bash('show_dashboard',TEST_SERVICE_ID='another-instance')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('运行配置未确认',result.stdout)
+
+    def test_summary_does_not_claim_shared_socks_are_independent(self):
+        config = self.managed_node()
+        socks = [o for o in config['outbounds'] if o['type']=='socks']
+        for outbound in socks:
+            outbound.update(server='shared.example',server_port=1080,username='same',password='same')
+        self.config.write_text(json.dumps(config))
+        result = self.run_bash('node_config summary')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('共用 1 组 SOCKS5',result.stdout)
+        self.assertNotIn('独立',result.stdout)
+
+    def test_pending_requires_explicit_apply_or_discard_before_destructive_operations(self):
+        self.managed_node()
+        result = self.run_bash('stage_changes set_node credentials',NEW_HY2_PASS='pending')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before = self.file_snapshot()
+        for body in ('service_cmd restart','service_cmd start','restore_backup','uninstall_cmd','discard_pending'):
+            result = self.run_bash(body)
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(self.file_snapshot(),before)
+        result = self.run_bash('discard_pending',DISCARD_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.app/'pending').exists())
+        self.assertNotIn('restart',(self.root/'service.log').read_text() if (self.root/'service.log').exists() else '')
+
+    def test_pending_noop_or_cancel_does_not_create_pending_and_preserves_existing_edits(self):
+        self.managed_node()
+        for body in ('stage_changes set_node ports',):
+            result = self.run_bash(body)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertFalse((self.app/'pending').exists())
+        result = self.run_terminal('stage_changes set_node regenerate','0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.app/'pending').exists())
+        result = self.run_bash('stage_changes set_node credentials',NEW_HY2_PASS='pending')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before = self.file_snapshot()
+        result = self.run_bash('stage_changes set_node ports')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+
+    def test_apply_pending_hopping_and_new_listen_port_keeps_metadata_consistent(self):
+        self.managed_node()
+        self.setup_nat()
+        result = self.run_bash('set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result = self.run_bash('stage_changes set_node ports',HY2_PORT='19555')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads((self.app/'hopping.json').read_text())['base_port'],9443)
+        result = self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads((self.app/'hopping.json').read_text())['base_port'],19555)
+        self.assertIn('redirect to :19555',json.loads(self.nat_state.read_text())['batch'])
+
+    def test_apply_rejects_live_config_changed_after_staging(self):
+        self.managed_node()
+        result = self.run_bash('stage_changes set_node credentials',NEW_HY2_PASS='pending')
+        self.assertEqual(result.returncode,0,result.stderr)
+        config = json.loads(self.config.read_text());config['log']['level']='debug'
+        self.config.write_text(json.dumps(config))
+        before = self.file_snapshot()
+        result = self.run_bash('apply_changes')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('被其他操作修改',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_start_already_active_service_does_not_falsely_record_disk_config(self):
+        self.managed_node()
+        (self.root/'active').touch()
+        result = self.run_bash("record_runtime_state() { die 'must not record unchanged process'; }; service_cmd start")
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.app/'runtime-state.json').exists())
+
+    def test_regenerate_choices_follow_actual_protocol_order_and_omit_missing_protocols(self):
+        config = self.managed_node()
+        config['inbounds'].reverse()
+        self.config.write_text(json.dumps(config))
+        result = self.run_terminal('stage_changes set_node regenerate','1\nYES\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        menu = result.stdout[:result.stdout.index('proxies:')]
+        self.assertIn('1. Hysteria2',menu)
+        self.assertIn('2. VLESS',menu)
+        self.assertNotIn('3. AnyTLS',menu)
+        pending = json.loads((self.app/'pending/config.json').read_text())
+        self.assertNotEqual(pending['inbounds'][0]['users'],config['inbounds'][0]['users'])
+        self.assertEqual(pending['inbounds'][1],config['inbounds'][1])
+
+    def test_pending_rejects_config_symlink_without_touching_external_file(self):
+        self.managed_node()
+        external = self.root/'external-config.json'
+        original = self.config.read_bytes()
+        self.config.rename(external)
+        self.config.symlink_to(external)
+        result = self.run_bash('stage_changes set_node credentials',NEW_HY2_PASS='pending')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('符号链接',result.stderr)
+        self.assertEqual(external.read_bytes(),original)
+        self.assertTrue(self.config.is_symlink())
+        self.assertFalse((self.app/'pending').exists())
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_menu_numbers_and_actions_follow_option_list_and_reject_overflow(self):
+        result = self.run_terminal("menu_action() { printf 'ACTION:%s\\n' \"$1\"; }; run_menu '自定义菜单' '' '第二项名称' status '第一项名称' check",
+                                   '9999999999999999999999999999999999999\n2\n0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('1. 第二项名称',result.stdout)
+        self.assertIn('2. 第一项名称',result.stdout)
+        self.assertIn('无效选择',result.stdout)
+        self.assertIn('ACTION:check',result.stdout)
+        self.assertNotIn('ACTION:status',result.stdout)
+
+    def test_hy2_bbr_edit_is_staged_without_rotating_credentials(self):
+        config = self.managed_node(anytls=True)
+        config['inbounds'][1].pop('bbr_profile')
+        self.config.write_text(json.dumps(config))
+        before = self.file_snapshot()
+        result = self.run_bash('stage_changes set_node bbr')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending = json.loads((self.app/'pending/config.json').read_text())
+        pending['inbounds'][1].pop('bbr_profile')
+        for item in pending['inbounds']:
+            tls = item['tls']
+            for key in ('certificate_path','key_path'):
+                if key in tls: tls[key]=tls[key].replace('/pending/tls/','/tls/')
+        self.assertEqual(pending,config)
+        self.assertEqual(json.loads((self.app/'pending/config.json').read_text())['inbounds'][1]['bbr_profile'],'standard')
+        after = self.file_snapshot()
+        self.assertEqual({p:data for p,data in after.items() if not p.startswith('deployment/pending/')},before)
+        self.assertFalse((self.root/'service.log').exists())
+        result = self.run_terminal('stage_changes set_node bbr','invalid-profile\n')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),after)
 
     def test_status_reads_deployed_ports(self):
         self.old_config()
