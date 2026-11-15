@@ -41,10 +41,30 @@ elif [[ $1 == generate ]]; then
 fi
 ''')
         self.bin.chmod(0o700)
+        # Never inspect or mutate the workstation firewall when a test omits a backend fixture.
+        inactive = self.root/'inactive-firewall'
+        inactive.mkdir()
+        tool = inactive/'backend'
+        tool.write_text("""#!/usr/bin/env python3
+import pathlib,sys
+name=pathlib.Path(sys.argv[0]).name;args=sys.argv[1:]
+if name=='ufw' and args==['status']: print('Status: inactive')
+elif name=='firewall-cmd' and args==['--state']: print('not running');sys.exit(252)
+elif name=='nft' and args[:3]==['-j','list','ruleset']: print('{"nftables": []}')
+elif name=='nft' and args[:3]==['-j','list','tables']: print('{"nftables": []}')
+elif name=='iptables' and args==['--version']: print('iptables v1.8 (legacy)')
+elif name=='iptables' and args==['-w','-S','INPUT']: print('-P INPUT ACCEPT')
+else: sys.exit(1)
+""")
+        tool.chmod(0o700)
+        for name in ('ufw','firewall-cmd','nft','iptables'):
+            (inactive/name).symlink_to(tool)
         self.prelude = f'''source {self.lib}
+export PATH={inactive}:"$PATH"
 BIN={self.bin}
 # Existing fixtures model deployments created before AnyTLS support.
 ANYTLS_PORT="${{ANYTLS_PORT_REQUEST:-}}"
+TUIC_PORT="${{TUIC_PORT_REQUEST:-}}"
 need_root() {{ :; }}
 sleep() {{ :; }}
 systemctl() {{
@@ -56,6 +76,7 @@ systemctl() {{
       is-enabled) [[ -f "$TEST_ROOT/hop-enabled" ]] ;;
       enable) touch "$TEST_ROOT/hop-enabled"; if [[ "$*" == *--now* ]]; then hopping_runtime start || return 1; touch "$TEST_ROOT/hop-active"; fi ;;
       disable) rm -f "$TEST_ROOT/hop-enabled"; if [[ "$*" == *--now* ]]; then hopping_runtime stop || return 1; rm -f "$TEST_ROOT/hop-active"; fi ;;
+      restart) hopping_runtime stop || return 1; hopping_runtime start || return 1; touch "$TEST_ROOT/hop-active" ;;
       start) hopping_runtime start || return 1; touch "$TEST_ROOT/hop-active" ;;
       stop) hopping_runtime stop || return 1; rm -f "$TEST_ROOT/hop-active" ;;
     esac
@@ -81,8 +102,8 @@ ss() {{
 '''
 
     def run_bash(self, body, **env):
-        return subprocess.run(['bash', '-c', self.prelude + body], text=True, capture_output=True,
-                              env={**os.environ, 'TEST_ROOT': str(self.root), **env}, timeout=20)
+        return subprocess.run(['bash', '-c', self.prelude + body], stdin=subprocess.DEVNULL, text=True,
+                              capture_output=True, env={**os.environ, 'TEST_ROOT': str(self.root), **env}, timeout=20)
 
     def old_config(self):
         self.config.parent.mkdir(parents=True)
@@ -908,7 +929,8 @@ stage_changes set_hopping
 
     def test_pending_noop_or_cancel_does_not_create_pending_and_preserves_existing_edits(self):
         self.managed_node()
-        for body in ('stage_changes set_node ports',):
+        self.setup_nat()
+        for body in ('stage_changes set_node ports','stage_changes set_hopping'):
             result = self.run_bash(body)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertFalse((self.app/'pending').exists())
@@ -1015,6 +1037,315 @@ stage_changes set_hopping
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(self.file_snapshot(),after)
 
+    def test_menu_zero_is_rendered_without_a_final_newline(self):
+        result=self.run_bash("menu_choices ' 1. 测试\\n 0. 退出'")
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('0. 退出',result.stdout)
+        result=self.run_terminal("run_menu '测试菜单' '' '测试' status",'0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('0. 返回 / 退出',result.stdout)
+
+    def test_tuic_generated_defaults_and_secure_exports(self):
+        import base64,uuid,hashlib,ssl
+        config=self.managed_node(anytls=True,tuic=True)
+        u=config['inbounds'][3]
+        self.assertEqual(u['type'],'tuic');self.assertEqual(u['listen_port'],11443)
+        self.assertEqual(u['congestion_control'],'bbr')
+        self.assertEqual(u['auth_timeout'],'3s');self.assertEqual(u['heartbeat'],'10s')
+        self.assertFalse(u['zero_rtt_handshake']);self.assertFalse(u['disable_path_mtu_discovery'])
+        uuid.UUID(u['users'][0]['uuid'])
+        self.assertNotEqual(u['users'][0]['uuid'],config['inbounds'][0]['users'][0]['uuid'])
+        self.assertEqual(len(base64.b64decode(u['users'][0]['password'])),32)
+        self.assertTrue(config['inbounds'][1]['ignore_client_bandwidth'])
+        for item in config['inbounds']:self.assertEqual(item['tls']['handshake_timeout'],'10s')
+        h=config['inbounds'][1]
+        for key in ('initial_packet_size','disable_path_mtu_discovery','idle_timeout','keep_alive_period','stream_receive_window','connection_receive_window','max_concurrent_streams'):
+            self.assertNotIn(key,h)
+        client=json.loads((self.app/'client/tuic.outbound.json').read_text())
+        self.assertEqual(client['uuid'],u['users'][0]['uuid'])
+        self.assertEqual(client['password'],u['users'][0]['password'])
+        self.assertFalse(client['tls']['insecure']);self.assertFalse(client['zero_rtt_handshake'])
+        self.assertEqual(client['tls']['handshake_timeout'],'10s')
+        self.assertNotIn('auth_timeout',client)
+        self.assertNotIn('ignore_client_bandwidth',json.loads((self.app/'client/hysteria2.outbound.json').read_text()))
+        result=self.run_bash('node_config yaml')
+        self.assertEqual(result.returncode,0,result.stderr)
+        text=result.stdout.split('  - name: "TUIC"',1)[1]
+        self.assertIn('heartbeat-interval: 10000',text)
+        self.assertIn('reduce-rtt: false',text)
+        self.assertIn('congestion-controller: "bbr"',text)
+        self.assertNotIn('token:',text)
+        pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.app/'tls/tuic.crt').read_text())).hexdigest()
+        self.assertIn(pin,text)
+        self.assertFalse((self.app/'client/proxies.yaml').exists())
+
+    def test_tuic_add_apply_port_change_rotation_and_owned_firewall(self):
+        original=self.managed_node()
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result=self.run_bash('stage_changes set_node add-tuic',TUIC_PORT='11443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=json.loads(self.config.read_text());self.assertEqual(before['inbounds'][:2],original['inbounds'])
+        self.assertIn('ALLOW 11443/udp',json.loads(self.firewall_state.read_text())['ufw'])
+        result=self.run_bash('stage_changes set_node ports',TUIC_PORT='12443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes set_node regenerate tuic')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertNotEqual(pending['inbounds'][2]['users'],before['inbounds'][2]['users'])
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        state=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 12443/udp',state);self.assertNotIn('ALLOW 11443/udp',state)
+        self.assertIn('ALLOW 22/tcp',state)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][2]['listen_port'],12443)
+
+    def test_tuic_conflict_and_apply_failure_preserve_live_and_pending(self):
+        self.managed_node()
+        before=self.file_snapshot()
+        result=self.run_bash('stage_changes set_node add-tuic',TUIC_PORT='9443')
+        self.assertNotEqual(result.returncode,0);self.assertEqual(self.file_snapshot(),before)
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result=self.run_bash('stage_changes set_node add-tuic',TUIC_PORT='11443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=self.file_snapshot();(self.root/'active').touch();(self.root/'fail-restart').touch()
+        result=self.run_bash('apply_changes')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertEqual(json.loads(self.firewall_state.read_text())['ufw'],['ALLOW 22/tcp'])
+        self.assertTrue((self.root/'active').exists())
+
+    def test_protocol_full_editor_preserves_all_fields_and_other_protocols(self):
+        original=self.managed_node(anytls=True,tuic=True)
+        candidate=json.loads(json.dumps(original['inbounds'][3]))
+        candidate.update(auth_timeout='7s',heartbeat='17s',congestion_control='cubic',max_concurrent_streams=37,idle_timeout='2m')
+        candidate['tls']['handshake_timeout']='20s'
+        candidate['users'].append({'name':'second','uuid':'00000000-0000-4000-8000-000000000001','password':'second: #password'})
+        candidate['tag']='renamed-tuic'
+        source=self.root/'input.json';source.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol tuic "{source}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        expected=json.loads(json.dumps(candidate))
+        for key in ('certificate_path','key_path'):expected['tls'][key]=expected['tls'][key].replace('/tls/','/pending/tls/')
+        self.assertEqual(pending['inbounds'][3],expected)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        self.assertEqual(current['inbounds'][:3],original['inbounds'][:3])
+        self.assertEqual(current['inbounds'][3],candidate)
+        client=json.loads((self.app/'client/tuic.outbound.json').read_text())
+        self.assertEqual(client['heartbeat'],'17s');self.assertEqual(client['tls']['handshake_timeout'],'20s')
+        self.assertEqual(client['password'],candidate['users'][0]['password'])
+        self.assertIn('第一个用户',result.stdout)
+
+    def test_protocol_full_editor_rejects_invalid_document_without_touching_live(self):
+        self.managed_node(anytls=True,tuic=True)
+        before=self.file_snapshot()
+        source=self.root/'bad.json'
+        for data in ('not json',json.dumps({'type':'vless','tag':'tuic','listen_port':11443}),json.dumps({'type':'tuic','tag':'hysteria2','listen_port':11443})):
+            source.write_text(data)
+            result=self.run_bash(f'stage_changes edit_protocol tuic "{source}"')
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_protocol_defaults_migration_is_staged_and_removes_optional_quic(self):
+        config=self.managed_node(anytls=True,tuic=True)
+        h=config['inbounds'][1]
+        h.update(ignore_client_bandwidth=False,initial_packet_size=1300,disable_path_mtu_discovery=True,idle_timeout='1m',keep_alive_period='15s',stream_receive_window='8 MB',connection_receive_window='20 MB',max_concurrent_streams=1024)
+        for item in config['inbounds']:item['tls']['handshake_timeout']='15s'
+        self.config.write_text(json.dumps(config))
+        result=self.run_bash('stage_changes update_protocol_defaults')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertTrue(pending['inbounds'][1]['ignore_client_bandwidth'])
+        for field in ('initial_packet_size','disable_path_mtu_discovery','idle_timeout','keep_alive_period','stream_receive_window','connection_receive_window','max_concurrent_streams'):
+            self.assertNotIn(field,pending['inbounds'][1])
+        for item in pending['inbounds']:self.assertEqual(item['tls']['handshake_timeout'],'10s')
+        self.assertEqual(json.loads(self.config.read_text()),config)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_apply_confirmation_and_restart_without_pending_refreshes_owned_service(self):
+        self.managed_node()
+        self.setup_nat()
+        result=self.run_bash('set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        (self.root/'service.log').unlink()
+        result=self.run_terminal('apply_changes','NO\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('确认即将应用',result.stdout)
+        self.assertNotIn('restart',(self.root/'service.log').read_text() if (self.root/'service.log').exists() else '')
+        result=self.run_terminal('apply_changes','YES\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service.log').read_text()
+        self.assertIn('restart sing-box.service',calls)
+        self.assertIn('restart sing-box-hopping.service',calls)
+        self.assertTrue((self.root/'active').exists());self.assertTrue((self.root/'hop-active').exists())
+
+    def test_tuic_backup_restore_roundtrip_and_legacy_restore(self):
+        original=self.managed_node()
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        legacy=self.root/'legacy.tar.gz';modern=self.root/'tuic.tar.gz'
+        result=self.run_bash(f'backup_cmd "{legacy}"\nstage_changes set_node add-tuic\napply_changes\nbackup_cmd "{modern}"',TUIC_PORT='11443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        result=self.run_bash(f'restore_backup "{legacy}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((self.app/'tls/tuic.key').exists())
+        self.assertNotIn('ALLOW 11443/udp',json.loads(self.firewall_state.read_text())['ufw'])
+        result=self.run_bash(f'restore_backup "{modern}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),current)
+        self.assertTrue((self.app/'client/tuic.outbound.json').exists())
+        self.assertIn('ALLOW 11443/udp',json.loads(self.firewall_state.read_text())['ufw'])
+
+    def test_interactive_full_editor_renews_managed_certificate_after_sni_change(self):
+        self.managed_node(anytls=True)
+        before=(self.app/'tls/anytls.crt').read_bytes()
+        editor=self.root/'editor'
+        editor.write_text('''#!/usr/bin/env python3
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]);c=json.loads(p.read_text());c['tls']['server_name']='edited.example.com';p.write_text(json.dumps(c))
+''')
+        editor.chmod(0o700)
+        result=self.run_terminal('stage_changes edit_protocol anytls','',EDITOR=str(editor))
+        self.assertEqual(result.returncode,0,result.stderr)
+        cert=(self.app/'pending/tls/anytls.crt').read_bytes()
+        self.assertNotEqual(cert,before)
+        self.assertEqual((self.app/'tls/anytls.crt').read_bytes(),before)
+        verify=subprocess.run(['openssl','verify','-CAfile',str(self.app/'pending/tls/anytls.crt'),'-verify_hostname','edited.example.com',str(self.app/'pending/tls/anytls.crt')],capture_output=True)
+        self.assertEqual(verify.returncode,0,verify.stderr)
+
+    def test_advanced_export_limitation_does_not_block_later_changes_or_restore(self):
+        original=self.managed_node()
+        candidate=json.loads(json.dumps(original['inbounds'][0]));candidate['transport']={'type':'ws','path':'/example'}
+        source=self.root/'advanced.json';source.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{source}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes set_node add-tuic',TUIC_PORT='11443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][0]['transport'],candidate['transport'])
+        self.assertTrue((self.app/'client/EXPORT-ERROR.txt').exists())
+        self.assertFalse((self.app/'client/tuic.outbound.json').exists())
+        path=self.root/'advanced.tar.gz'
+        result=self.run_bash(f'backup_cmd "{path}"\nrestore_backup "{path}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.app/'client/EXPORT-ERROR.txt').exists())
+
+    def test_full_editor_tag_rename_and_plain_vless_flow_export(self):
+        config=self.managed_node(anytls=True)
+        config['inbounds'][2]['tag']='a-custom'
+        config['dns']['rules']=[{'inbound':['vless-reality'],'server':'local'}]
+        self.config.write_text(json.dumps(config))
+        candidate=json.loads(json.dumps(config['inbounds'][0]));candidate['tag']='anytls';candidate['users'][0].pop('flow')
+        path=self.root/'renamed.json';path.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{path}"\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        self.assertEqual(current['dns']['rules'][0]['inbound'],['anytls'])
+        outbound=json.loads((self.app/'client/vless-reality.outbound.json').read_text())
+        self.assertEqual(outbound['flow'],'')
+        result=self.run_bash('load_node_settings')
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_full_editor_allows_same_port_on_disjoint_listen_addresses(self):
+        config=self.managed_node(anytls=True)
+        config['inbounds'][0]['listen']='127.0.0.1'
+        self.config.write_text(json.dumps(config))
+        candidate=json.loads(json.dumps(config['inbounds'][2]));candidate.update(listen='127.0.0.2',listen_port=8443)
+        path=self.root/'separate.json';path.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol anytls "{path}"\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][2]['listen'],'127.0.0.2')
+
+    def test_apply_menu_reexecutes_manager_after_success(self):
+        entry=self.root/'entry.sh'
+        entry.write_text('''case "$1" in
+apply) echo APPLIED ;;
+menu) echo MANAGER_REFRESHED ;;
+esac
+''')
+        result=self.run_terminal(f'SCRIPT_PATH="{entry}"\nmenu_action apply','\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('MANAGER_REFRESHED',result.stdout)
+
+    def test_full_editor_quic_transport_changes_listener_firewall_and_summary(self):
+        config=self.managed_node(anytls=True)
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result=self.run_bash('load_node_settings\nbegin_transaction files "$APP/firewall-owned.json"\nopen_firewall\nupdate_firewall_ownership\nTRANSACTION=""')
+        self.assertEqual(result.returncode,0,result.stderr)
+        candidate=json.loads(json.dumps(config['inbounds'][0]))
+        candidate['users'][0].pop('flow')
+        candidate['tls']=json.loads(json.dumps(config['inbounds'][1]['tls']))
+        candidate['transport']={'type':'quic'}
+        path=self.root/'quic.json';path.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{path}"\napply_changes\nnode_config summary')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 8443/udp',rules)
+        self.assertNotIn('ALLOW 8443/tcp',rules)
+        self.assertIn('VLESS：UDP 8443',result.stdout)
+        queries=(self.root/'service.log').read_text()
+        self.assertIn('restart sing-box.service',queries)
+        self.assertTrue((self.app/'client/EXPORT-ERROR.txt').exists())
+
+    def test_legacy_protocol_tags_do_not_impersonate_optional_protocols(self):
+        config=self.managed_node()
+        candidate=json.loads(json.dumps(config['inbounds'][0]));candidate['tag']='anytls'
+        path=self.root/'tag.json';path.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{path}"\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes set_node add-anytls',ANYTLS_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertEqual(pending['inbounds'][0]['tag'],'anytls')
+        self.assertEqual(pending['inbounds'][2]['type'],'anytls')
+        self.assertNotEqual(pending['inbounds'][2]['tag'],'anytls')
+
+    def test_full_editor_allows_plain_vless_with_null_optional_tls(self):
+        config=self.managed_node()
+        candidate=json.loads(json.dumps(config['inbounds'][0]));candidate['tls']=None;candidate['users'][0].pop('flow')
+        path=self.root/'plain.json';path.write_text(json.dumps(candidate))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{path}"\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIsNone(json.loads(self.config.read_text())['inbounds'][0]['tls'])
+        self.assertTrue((self.app/'client/EXPORT-ERROR.txt').exists())
+
+    def test_disjoint_listeners_sharing_new_port_add_one_firewall_rule(self):
+        config=self.managed_node(anytls=True)
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        v=json.loads(json.dumps(config['inbounds'][0]));v.update(listen='127.0.0.1',listen_port=28443)
+        a=json.loads(json.dumps(config['inbounds'][2]));a.update(listen='127.0.0.2',listen_port=28443)
+        vp=self.root/'v.json';vp.write_text(json.dumps(v))
+        ap=self.root/'a.json';ap.write_text(json.dumps(a))
+        result=self.run_bash(f'stage_changes edit_protocol vless "{vp}"\nstage_changes edit_protocol anytls "{ap}"\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertEqual(rules.count('ALLOW 28443/tcp'),1)
+        ledger=json.loads((self.app/'firewall-owned.json').read_text())
+        self.assertEqual(sum(r['proto']=='tcp' and r['port']==28443 for r in ledger),1)
+
+    def test_tuic_cannot_be_redirected_by_hy2_hopping_range(self):
+        self.managed_node()
+        self.setup_nat()
+        result=self.run_bash('stage_changes set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=self.file_snapshot();nat=self.nat_state.read_bytes()
+        result=self.run_bash('stage_changes set_node add-tuic',TUIC_PORT='20003')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('跳跃端口冲突',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertEqual(self.nat_state.read_bytes(),nat)
+
     def test_status_reads_deployed_ports(self):
         self.old_config()
         config = json.loads(self.config.read_text())
@@ -1030,13 +1361,14 @@ firewall_hints() { :; }
 status_cmd
 ''', VLESS_PORT='8443', HY2_PORT='9443')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('TCP 12345 and UDP 23456', result.stdout)
+        self.assertIn('TCP 12345', result.stdout)
+        self.assertIn('UDP 23456', result.stdout)
         queries = (self.root/'ss.log').read_text()
         self.assertIn(':12345', queries)
         self.assertIn(':23456', queries)
         self.assertNotIn(':8443', queries)
 
-    def managed_node(self, anytls=False):
+    def managed_node(self, anytls=False, tuic=False):
         self.config.parent.mkdir(parents=True)
         for name in ('tls', 'client', 'rules'):
             (self.app / name).mkdir(parents=True)
@@ -1052,8 +1384,12 @@ if [[ -n "$ANYTLS_PORT" ]]; then
   ANYTLS_SNI="$REALITY_DOMAIN"
   make_tls_certificate anytls "$ANYTLS_SNI"
 fi
+if [[ -n "$TUIC_PORT" ]]; then
+  TUIC_SNI="$REALITY_DOMAIN"
+  make_tls_certificate tuic "$TUIC_SNI"
+fi
 write_jsons
-''', ANYTLS_PORT='10443' if anytls else '')
+''', ANYTLS_PORT='10443' if anytls else '', TUIC_PORT='11443' if tuic else '')
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(self.config.read_text())
 
@@ -1166,10 +1502,11 @@ write_jsons
     def test_occupied_port_rejected_before_mutation(self):
         self.managed_node()
         before=self.file_snapshot()
-        result=self.run_bash("ss() { echo occupied; }\nset_node ports",VLESS_PORT='12345')
-        self.assertNotEqual(result.returncode,0)
-        self.assertEqual(self.file_snapshot(),before)
-        self.assertIn('已被占用',result.stderr)
+        for cmd in ('set_node ports','stage_changes set_node ports'):
+            result=self.run_bash(f"ss() {{ echo occupied; }}\n{cmd}",VLESS_PORT='12345')
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(self.file_snapshot(),before)
+            self.assertIn('已被占用',result.stderr)
 
     def test_sni_edit_renews_certificate_and_preserves_other_credentials(self):
         before=self.managed_node()
@@ -1313,7 +1650,7 @@ download_rules() { :; }
         self.assertTrue(self.config.exists())
         config = json.loads(self.config.read_text())
         self.assertEqual([(i['type'],i['listen_port']) for i in config['inbounds']],
-                         [('vless',443),('hysteria2',443),('anytls',8443)])
+                         [('vless',443),('hysteria2',443),('anytls',8443),('tuic',10443)])
         self.assertFalse((self.app/'client/proxies.yaml').exists())
         self.assertTrue((self.app/'manager.sh').exists())
         self.assertTrue((self.root/'bin/sb-manager').exists())
@@ -1562,6 +1899,10 @@ def save():p.write_text(json.dumps(s))
 def done(code=0,text=''):
     if text:print(text)
     sys.exit(code)
+if tool=='ufw' and a[:1]==['status']:
+    done(text='Status: inactive')
+if tool=='firewall-cmd' and a==['--state']:
+    done(252,'not running')
 if tool=='nft':
     if a==['-j','list','tables']:
         done(text=json.dumps({'nftables':[{'table':{'family':'ip','name':'sing_box_hy2_hop'}}] if s.get('batch') else []}))
@@ -1592,7 +1933,7 @@ else:
 done(99,'Unexpected NAT operation: '+repr([tool,*a]))
 ''')
         script.chmod(0o700)
-        for tool in ('nft','iptables'):(fake/tool).symlink_to(script)
+        for tool in ('ufw','firewall-cmd','nft','iptables'):(fake/tool).symlink_to(script)
         self.nat_state=self.root/'nat.json'
         self.nat_state.write_text(json.dumps({'batch':'','chains':[],'rules':[],**options}))
         self.prelude+=f'export PATH={fake}:"$PATH"\n'
@@ -1734,6 +2075,8 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
 
     def test_restore_can_recover_a_broken_current_config(self):
         original=self.managed_node()
+        original['inbounds'][1]['tag']='renamed-hy2'
+        self.config.write_text(json.dumps(original))
         result=self.run_bash('backup_cmd');self.assertEqual(result.returncode,0,result.stderr)
         archive=next((self.root/'backups').glob('*.tar.gz'))
         self.config.write_text('broken json')
@@ -1741,6 +2084,18 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
         result=self.run_bash('restore_backup "'+str(archive)+'"')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(json.loads(self.config.read_text()),original)
+
+    def test_restore_validates_hopping_against_backup_config(self):
+        original=self.managed_node();self.setup_nat()
+        result=self.run_bash('set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('backup_cmd');self.assertEqual(result.returncode,0,result.stderr)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        self.config.write_text('broken json')
+        result=self.run_bash('restore_backup "'+str(archive)+'"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertTrue(json.loads((self.app/'hopping.json').read_text())['enabled'])
 
     def test_backup_rejects_links_and_does_not_overwrite_existing_target(self):
         self.managed_node()
