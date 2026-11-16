@@ -447,7 +447,7 @@ show_node_details
 
     def test_output_colors_require_terminal_and_leave_yaml_plain(self):
         self.managed_node()
-        body = "ui title '标题'\nmenu_choices ' 1. 安装\\n13. 卸载\\n'\nnode_config show"
+        body = "ui title '标题'\nmenu_choices $' 1. 安装\\n13. 卸载\\n'\nnode_config show"
         result = self.run_bash(body, TERM='xterm')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('\x1b', result.stdout)
@@ -642,6 +642,10 @@ update_firewall_ownership
 TRANSACTION=""
 ''')
         self.assertEqual(result.returncode,0,result.stderr)
+        config=json.loads(self.config.read_text())
+        config['inbounds'][0]['listen_port']=10443
+        config['inbounds'][2]['listen_port']=10444
+        self.config.write_text(json.dumps(config))
         result = self.run_bash('''VLESS_PORT=10443
 HY2_PORT=9443
 ANYTLS_PORT=10444
@@ -1015,6 +1019,150 @@ stage_changes set_hopping
         self.assertIn('ACTION:check',result.stdout)
         self.assertNotIn('ACTION:status',result.stdout)
 
+    def test_port_adjustment_boundaries_display_current_occupied_ports(self):
+        self.managed_node()
+        # Every JSON field edit can alter a nested port, so it also displays the snapshot.
+        result=self.run_terminal('stage_changes edit_inbound_field hysteria2 /listen_port', '9555\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertLess(result.stderr.index('当前已占用端口'),result.stderr.index('/listen_port：'))
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertEqual(pending['inbounds'][1]['listen_port'],9555)
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_terminal('read_ports HY2_PORT','9443\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertLess(result.stderr.index('当前已占用端口'),result.stderr.index('HY2_PORT 监听端口'))
+        result=self.run_bash('ss() { echo "udp UNCONN 0 0 0.0.0.0:32100 *:*"; }; show_occupied_ports')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('32100',result.stderr)
+        self.assertEqual(result.stdout,'')
+
+    def test_protocol_menu_follows_pending_inbounds_including_custom_types(self):
+        config=self.managed_node()
+        config['inbounds'].append({'type':'socks','tag':'custom-entry','listen_port':1080,'listen':'127.0.0.1','users':[{'username':'private-user','password':'private-password'}]})
+        self.config.write_text(json.dumps(config))
+        result=self.run_bash("stage_changes edit_inbound_field @2 /tag '\"renamed-custom\"'")
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('protocol_entries')
+        self.assertEqual(result.returncode,0,result.stderr)
+        entries=result.stdout.split('\0')
+        self.assertIn('socks · renamed-custom',entries);self.assertIn('inbound:@2',entries)
+        self.assertNotIn('private-password',result.stdout)
+        result=self.run_bash('menu_config menu-inbound @2')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('field:/listen_port',result.stdout)
+        self.assertNotIn('hopping',result.stdout)
+        self.assertNotIn('AnyTLS',result.stdout)
+
+    def test_field_menu_recurses_and_keeps_values_private(self):
+        self.managed_node(tuic=True)
+        result=self.run_bash('node_config menu-fields @2 /tls')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('switch:/tls/enabled',result.stdout)
+        result=self.run_bash('node_config menu-fields @2 /users/0')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('field:/users/0/password',result.stdout)
+        self.assertNotIn('tuic-secret',result.stdout)
+        self.assertIn('remove:/users/0',result.stdout)
+
+    def test_optional_fields_can_be_disabled_removed_and_added_without_reload(self):
+        self.managed_node(tuic=True)
+        result=self.run_bash("stage_changes edit_inbound_field tuic /zero_rtt_handshake true\nstage_changes edit_inbound_field tuic /zero_rtt_handshake false\nstage_changes edit_inbound_field tuic /heartbeat :remove\nstage_changes edit_inbound_field tuic /heartbeat '\"17s\"'")
+        self.assertEqual(result.returncode,0,result.stderr)
+        item=json.loads((self.app/'pending/config.json').read_text())['inbounds'][2]
+        self.assertFalse(item['zero_rtt_handshake']);self.assertEqual(item['heartbeat'],'17s')
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][2]['heartbeat'],'10s')
+        self.assertFalse((self.root/'service.log').exists())
+        before=self.file_snapshot()
+        for pointer,value in (('/heartbeat','invalid-json'),('not-pointer','true'),('/users/nope/password','true')):
+            result=self.run_bash(f'stage_changes edit_inbound_field tuic "{pointer}" "{value}"')
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(self.file_snapshot(),before)
+
+    def test_dynamic_menu_rebuilds_after_each_action(self):
+        result=self.run_terminal("""counter_file="$TEST_ROOT/menu-counter"
+echo first > "$counter_file"
+entries() { if [[ $(cat "$counter_file") == first ]]; then printf '初始项\\0status\\0'; else printf '更新项\\0check\\0'; fi; }
+menu_action() { printf 'ACTION:%s\\n' "$1"; echo second > "$counter_file"; }
+run_menu 动态菜单 '' @entries""",'1\n1\n0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('ACTION:status',result.stdout);self.assertIn('ACTION:check',result.stdout)
+        self.assertIn('1. 更新项',result.stdout)
+
+    def test_creation_menu_omits_already_pending_protocol(self):
+        self.managed_node()
+        result=self.run_bash('stage_changes set_node add-tuic')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('protocol_creation_entries')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('add-anytls',result.stdout);self.assertNotIn('add-tuic',result.stdout)
+
+    def test_config_tags_are_rendered_literally_without_hiding_exit(self):
+        config=self.managed_node()
+        config['inbounds'][0]['tag']=r'user\cnode'
+        self.config.write_text(json.dumps(config))
+        result=self.run_terminal('protocol_menu','0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(r'user\cnode',result.stdout)
+        self.assertIn('hysteria2',result.stdout);self.assertIn('0. 返回 / 退出',result.stdout)
+
+    def test_custom_inbound_port_edits_update_owned_firewall(self):
+        config=self.managed_node()
+        config['inbounds'].append({'type':'socks','tag':'custom','listen':'::','listen_port':12443})
+        self.config.write_text(json.dumps(config))
+        self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result=self.run_bash('begin_transaction update "$APP/firewall-owned.json"\nopen_firewall\nupdate_firewall_ownership\nTRANSACTION=""')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes edit_inbound_field @2 /listen_port 12444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 12444/tcp',rules);self.assertNotIn('ALLOW 12443/tcp',rules)
+        self.assertIn('ALLOW 22/tcp',rules)
+
+    def test_duplicate_protocol_instances_can_be_edited_and_applied_separately(self):
+        config=self.managed_node()
+        extra=json.loads(json.dumps(config['inbounds'][0]));extra.update(tag='second-vless',listen_port=12443)
+        config['inbounds'].append(extra);self.config.write_text(json.dumps(config))
+        result=self.run_bash('stage_changes edit_inbound_field @2 /listen_port 12444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        self.assertEqual(current['inbounds'][0],config['inbounds'][0])
+        self.assertEqual(current['inbounds'][2]['listen_port'],12444)
+        self.assertTrue((self.app/'client/EXPORT-ERROR.txt').exists())
+
+    def test_hopping_menu_and_edits_follow_selected_hy2_instance(self):
+        config=self.managed_node();self.setup_nat()
+        extra=json.loads(json.dumps(config['inbounds'][1]));extra.update(tag='second-hy2',listen_port=12443)
+        config['inbounds'].append(extra);self.config.write_text(json.dumps(config))
+        result=self.run_bash('stage_changes set_hopping @2',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads((self.app/'pending/hopping.json').read_text())['base_port'],12443)
+        result=self.run_bash('menu_config menu-inbound @1')
+        self.assertEqual(result.returncode,0,result.stderr);self.assertNotIn('disable-hopping',result.stdout)
+        result=self.run_bash('menu_config menu-inbound @2')
+        self.assertEqual(result.returncode,0,result.stderr);self.assertIn('disable-hopping',result.stdout)
+        result=self.run_bash('stage_changes edit_inbound_field @1 /listen_port 9555\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads((self.app/'hopping.json').read_text())['base_port'],12443)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][1]['listen_port'],9555)
+
+    def test_generic_listener_network_controls_firewall_and_retirement(self):
+        config=self.managed_node()
+        config['inbounds'].append({'type':'direct','tag':'direct-test','listen':'::','listen_port':12443,'network':'udp'})
+        self.config.write_text(json.dumps(config));self.setup_firewall('ufw')
+        result=self.run_bash('configuration_listeners')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('udp 12443 direct-test',result.stdout);self.assertNotIn('tcp 12443',result.stdout)
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes edit_inbound_field @2 /network \'"tcp"\'\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 12443/tcp',rules);self.assertNotIn('ALLOW 12443/udp',rules)
+        result=self.run_bash('stage_changes edit_inbound_field @2 /network :remove\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 12443/tcp',rules);self.assertIn('ALLOW 12443/udp',rules)
+
     def test_hy2_bbr_edit_is_staged_without_rotating_credentials(self):
         config = self.managed_node(anytls=True)
         config['inbounds'][1].pop('bbr_profile')
@@ -1038,7 +1186,7 @@ stage_changes set_hopping
         self.assertEqual(self.file_snapshot(),after)
 
     def test_menu_zero_is_rendered_without_a_final_newline(self):
-        result=self.run_bash("menu_choices ' 1. 测试\\n 0. 退出'")
+        result=self.run_bash("menu_choices $' 1. 测试\\n 0. 退出'")
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('0. 退出',result.stdout)
         result=self.run_terminal("run_menu '测试菜单' '' '测试' status",'0\n')
@@ -2431,6 +2579,111 @@ done(99,'Unexpected firewall operation: '+repr([tool,*a]))
         self.assertEqual(state['ufw'], ['ALLOW 9443/udp','ALLOW 8443/tcp'])
         log = (self.root/'firewall.log').read_text()
         self.assertNotIn('"enable"',log)
+
+    def test_firewall_automation_off_preserves_rules_and_later_enable_reconciles_ports(self):
+        self.managed_node()
+        initial=self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        ledger=self.app/'firewall-owned.json';ledger.write_text('[]')
+        result=self.run_bash('''set_firewall_auto false
+begin_transaction update "$APP/firewall-owned.json"
+VLESS_PORT=8443 HY2_PORT=9443 open_firewall 443 443
+VLESS_PORT=8443 HY2_PORT=9443 update_firewall_ownership 443 443
+TRANSACTION=''
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.firewall_state.read_text()),initial)
+        self.assertFalse((self.root/'firewall.log').exists())
+        self.assertEqual(json.loads(ledger.read_text()),[])
+        settings=self.app/'firewall-settings.json'
+        self.assertEqual(settings.stat().st_mode&0o777,0o600)
+        self.assertFalse(json.loads(settings.read_text())['automatic_ports'])
+        result=self.run_bash('''set_firewall_auto true
+begin_transaction update "$APP/firewall-owned.json"
+VLESS_PORT=8443 HY2_PORT=9443 open_firewall 8443 9443
+VLESS_PORT=8443 HY2_PORT=9443 update_firewall_ownership 8443 9443
+TRANSACTION=''
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(set(json.loads(self.firewall_state.read_text())['ufw']),{'ALLOW 22/tcp','ALLOW 8443/tcp','ALLOW 9443/udp'})
+        self.assertEqual(len(json.loads(ledger.read_text())),2)
+
+    def test_firewall_malformed_automation_setting_fails_before_rule_mutation(self):
+        self.managed_node();initial=self.setup_firewall('ufw')
+        (self.app/'firewall-settings.json').write_text('{"automatic_ports":"false"}')
+        result=self.run_bash('open_firewall')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('设置格式无效',result.stderr)
+        self.assertEqual(json.loads(self.firewall_state.read_text()),initial)
+        self.assertFalse((self.root/'firewall.log').exists())
+
+    def test_firewall_status_details_are_read_only_and_show_owned_rules(self):
+        self.managed_node();initial=self.setup_firewall('ufw',ufw=['ALLOW 22/tcp'])
+        result=self.run_bash('firewall_status details')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('UFW：已开启',result.stdout)
+        self.assertIn('22/tcp',result.stdout)
+        self.assertIn('自动放行端口：true',result.stdout)
+        self.assertIn('本脚本记录的放行规则：0 条',result.stdout)
+        self.assertEqual(json.loads(self.firewall_state.read_text()),initial)
+
+    def test_system_firewall_requires_confirmation_and_verifies_ufw_toggle(self):
+        mocks='''ufw() {
+  if [[ "$1" == status ]]; then
+    if [[ -f "$TEST_ROOT/ufw-active" ]]; then echo 'Status: active'; else echo 'Status: inactive'; fi
+  elif [[ "$*" == '--force enable' ]]; then touch "$TEST_ROOT/ufw-active"
+  elif [[ "$*" == '--force disable' ]]; then rm -f "$TEST_ROOT/ufw-active"
+  else return 99; fi
+}
+firewall-cmd() { echo 'not running';return 252; }
+'''
+        result=self.run_bash(mocks+'firewall_system enable ufw')
+        self.assertNotEqual(result.returncode,0)
+        self.assertFalse((self.root/'ufw-active').exists())
+        result=self.run_bash(mocks+'firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.root/'ufw-active').exists())
+        result=self.run_bash(mocks+'firewall_system disable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.root/'ufw-active').exists())
+
+    def test_system_firewall_firewalld_toggle_is_persistent_and_verified(self):
+        mocks='''ufw() { echo 'Status: inactive'; }
+firewall-cmd() {
+  if [[ -f "$TEST_ROOT/firewalld-active" ]]; then echo running;else echo 'not running';return 252;fi
+}
+systemctl() {
+  echo "$*" >> "$TEST_ROOT/firewalld-service.log"
+  case "$*" in
+    'enable --now firewalld.service') touch "$TEST_ROOT/firewalld-active" ;;
+    'disable --now firewalld.service') rm -f "$TEST_ROOT/firewalld-active" ;;
+    *) return 99 ;;
+  esac
+}
+'''
+        result=self.run_bash(mocks+'firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.root/'firewalld-active').exists())
+        result=self.run_bash(mocks+'firewall_system disable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.root/'firewalld-active').exists())
+        self.assertEqual((self.root/'firewalld-service.log').read_text().splitlines(),['enable --now firewalld.service','disable --now firewalld.service'])
+
+    def test_system_firewall_refuses_enabling_second_active_manager(self):
+        result=self.run_bash('''firewall-cmd() { echo running; }
+ufw() { echo mutation >> "$TEST_ROOT/ufw-mutations"; }
+firewall_system enable ufw
+''',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('firewalld 已运行',result.stderr)
+        self.assertFalse((self.root/'ufw-mutations').exists())
+
+    def test_system_firewall_does_not_report_success_when_command_fails(self):
+        result=self.run_bash('''firewall-cmd() { echo 'not running';return 252; }
+ufw() { if [[ "$1" == '--force' ]]; then return 9;fi;echo 'Status: inactive'; }
+firewall_system enable ufw
+''',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,9)
+        self.assertNotIn('已执行',result.stderr)
 
     def test_firewall_ufw_failure_restores_existing_rules(self):
         initial = self.setup_firewall('ufw', ufw=['ALLOW 8443/tcp'], fail='9443/udp')

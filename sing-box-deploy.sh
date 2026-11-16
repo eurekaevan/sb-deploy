@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable sing-box server deployment: VLESS Reality/TCP + Hysteria2/UDP + AnyTLS/TCP.
+# sing-box deployment with config-driven inbound editing and owned firewall management.
 # Google/YouTube via Google SOCKS5; remaining AI via AI SOCKS5; other public traffic via Other SOCKS5.
 # Installs stable sing-box from the official APT/DNF repository; uses packaged systemd unit.
 # Tested syntactically on Linux; run as root on a systemd server with apt-get or dnf.
@@ -20,6 +20,7 @@ DEFAULT_OTHER_SOCKS_HOST=''
 DEFAULT_OTHER_SOCKS_PORT=''
 DEFAULT_OTHER_SOCKS_USER=''
 DEFAULT_OTHER_SOCKS_PASS=''
+DEFAULT_FIREWALL_AUTO='true' # Manage only this script's owned port permits.
 DEFAULT_SOCKS_TFO='true' # Applies to all three SOCKS5 outbounds.
 REQUEST_SOCKS_TFO="${SOCKS_TFO-}"
 SOCKS_TFO="${SOCKS_TFO-$DEFAULT_SOCKS_TFO}"
@@ -98,13 +99,14 @@ ui() {
 menu_choices() {
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == *卸载* ]]; then ui error "$line"
+    if [[ "$line" == *卸载* || "$line" == *关闭系统防火墙* ]]; then ui error "$line"
+    elif [[ "$line" == *应用配置并重启* || "$line" == *'· 开启'* ]]; then ui success "$line"
     elif [[ "$line" == *重新生成* || "$line" == *含访问凭据* ]]; then ui warning "$line"
     elif [[ "$line" =~ ^([[:space:]]*[0-9]+\.)(.*)$ ]]; then
       ui item "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
     elif [[ -n "$line" ]]; then ui title "$line"
     else printf '\n'; fi
-  done < <(printf '%b' "$1")
+  done < <(printf '%s' "$1")
 }
 
 log() { printf '\n' >&2; ui info "[sing-box-deploy] $*" >&2; }
@@ -217,9 +219,14 @@ usage() {
   apply                应用全部待应用修改并重启服务（失败自动回滚，保留待应用修改）
   discard-pending      丢弃待应用修改；非交互需 DISCARD_CONFIRM=YES
   summary              显示真实服务/版本、已确认运行配置及待应用配置
+  firewall-status / firewall-details  查看防火墙状态及规则详情
+  firewall-auto true|false  开关脚本自动放行（保留现有规则，下次 apply 生效）
+  firewall-enable / firewall-disable [ufw|firewalld]  系统开关，需明确 YES 确认
   set-ports            修改端口，默认保留当前值；可传 VLESS_PORT、HY2_PORT、ANYTLS_PORT、TUIC_PORT
   add-anytls           为旧部署添加 AnyTLS；可传 ANYTLS_PORT、NEW_ANYTLS_SNI、NEW_ANYTLS_PASS
   add-tuic             暂存生成 TUIC（独立 UUID/密码/证书），可传 TUIC_PORT、NEW_TUIC_SNI
+  edit-field 标签 /字段路径 [JSON值|:remove]  逐项编辑或移除字段，保存后需 apply
+  disable-hopping      暂存关闭 HY2 跳跃规则，保存后需 apply
   edit-protocol [标签] [JSON文件]  完整编辑现有入站所有字段；交互时调用 EDITOR
   set-protocol-defaults 更新已有协议的 TLS 10s、HY2 ignore_client_bandwidth 及 TUIC 默认参数
   export-yaml          可选导出 Clash/Mihomo proxies.yaml；普通生成/导出只在结果中显示 YAML
@@ -319,7 +326,20 @@ EOF
   (( major > 1 || (major == 1 && minor >= 14) )) || die "sing-box >= 1.14 is required (installed: ${ver})"
 }
 
+show_occupied_ports() {
+  OCCUPIED_PORTS=''
+  ui title '── 当前已占用端口 · TCP / UDP ──'
+  if ! command -v ss >/dev/null; then
+    warn '无法读取占用情况：未安装 ss，请安装 iproute2 / iproute 后再核实端口。'
+    return 0
+  fi
+  OCCUPIED_PORTS="$(ss -H -lntup)" || { warn '读取端口失败，请先检查系统网络工具。'; return 1; }
+  printf '%s\n' "${OCCUPIED_PORTS:-当前没有监听端口}"
+  ui info 'TCP 与 UDP 分别判断；本机占用情况不代表云安全组已放行。'
+} >&2
+
 read_ports() {
+  show_occupied_ports
   local name value answer
   for name in ${*:-VLESS_PORT HY2_PORT ANYTLS_PORT TUIC_PORT}; do
     [[ ( "$name" != ANYTLS_PORT && "$name" != TUIC_PORT ) || -n "${!name}" ]] || continue
@@ -337,6 +357,7 @@ read_ports() {
 
 # Each SOCKS upstream uses a separate set of credentials; never print passwords.
 read_socks_profile() {
+  show_occupied_ports
   local profile="$1" label prefix key fallback host port user pass answer
   label="${profile^}"
   prefix="${profile^^}_SOCKS"
@@ -640,8 +661,13 @@ labels={'vless':'VLESS','hysteria2':'Hysteria2','anytls':'AnyTLS','tuic':'TUIC'}
 for item in json.load(open(sys.argv[1])).get('inbounds',[]):
     if 'listen_port' not in item: continue
     kind=item.get('type') or item.get('tag')
-    network='udp' if kind in ('hysteria','hysteria2','tuic') or (item.get('transport') or {}).get('type')=='quic' else 'tcp'
-    print(network,item['listen_port'],labels.get(kind,item.get('tag','协议')))
+    # direct/shadowsocks listen on both networks when unspecified (official inbound docs).
+    if (item.get('transport') or {}).get('type')=='quic': networks=['udp']
+    elif item.get('network'): networks=[item['network']]
+    elif kind in ('direct','shadowsocks'): networks=['tcp','udp']
+    else: networks=['udp' if kind in ('hysteria','hysteria2','tuic') else 'tcp']
+    for network in networks:
+        print(network,item['listen_port'],labels.get(kind,item.get('tag','协议')))
 PYCODE
 }
 
@@ -672,6 +698,12 @@ start_official_unit() {
 # Add rules through the active manager; only journal additions made by this run.
 open_firewall() {
   [[ ${STAGING:-0} != 1 ]] || return 0
+  local automatic
+  automatic="$(firewall_auto)" || return
+  if [[ "$automatic" == false ]]; then
+    warn '自动放行端口已关闭；现有规则保持不变，请自行确认端口可达。'
+    return 0
+  fi
   local ufw_active=0 firewalld_active=0 output rc entry zone zones mode port proto rules chains family table chain
   local -a endpoints=() desired=("${VLESS_NETWORK:-tcp}/$VLESS_PORT" "udp/$HY2_PORT") previous=()
   [[ -z "$ANYTLS_PORT" ]] || desired+=("tcp/$ANYTLS_PORT")
@@ -680,6 +712,16 @@ open_firewall() {
   [[ -z "${2:-}" ]] || previous+=("udp/$2")
   [[ -z "${3:-}" ]] || previous+=("tcp/$3")
   [[ -z "${4:-}" ]] || previous+=("udp/$4")
+  # Explicitly enabling automation also reconciles ports changed while it was disabled.
+  [[ ! -f "$APP/firewall-settings.json" ]] || previous=()
+  local configured network label
+  if [[ -f "$CONFIG" ]]; then
+    configured="$(configuration_listeners)"
+    desired=()
+    while read -r network port label; do
+      [[ -z "$port" ]] || desired+=("$network/$port")
+    done <<< "$configured"
+  fi
   local candidate known
   local -A scheduled=()
   for candidate in "${desired[@]}"; do
@@ -881,6 +923,155 @@ for item in json.load(sys.stdin)["nftables"]:
     update_firewall_ownership restore || failed=1
   fi
   return "$failed"
+}
+
+# This preference changes future port management, never existing rules or the service.
+firewall_auto() {
+  python3 - "$APP/firewall-settings.json" "$DEFAULT_FIREWALL_AUTO" "${1:-}" <<'PYCODE'
+import json, os, pathlib, sys, tempfile
+p=pathlib.Path(sys.argv[1]);value=sys.argv[3]
+if value:
+    if value not in ('true','false'): sys.exit('自动放行开关必须是 true 或 false。')
+    if not p.parent.is_dir(): sys.exit('请先安装节点，再设置自动放行端口。')
+    if p.is_symlink(): sys.exit('拒绝覆盖防火墙设置符号链接。')
+    with tempfile.NamedTemporaryFile(mode='w',dir=p.parent,prefix='.firewall-settings-',delete=False) as f:
+        temporary=pathlib.Path(f.name)
+        try:
+            json.dump({'automatic_ports':value=='true'},f);f.write('\n');f.flush()
+            os.fchmod(f.fileno(),0o600);temporary.replace(p)
+        finally:
+            temporary.unlink(missing_ok=True)
+    print(value)
+else:
+    if p.is_symlink(): sys.exit('拒绝读取防火墙设置符号链接。')
+    if p.exists():
+        data=json.loads(p.read_text());value=data.get('automatic_ports')
+        if type(value) is not bool: sys.exit('防火墙自动放行设置格式无效。')
+        print('true' if value else 'false')
+    else:
+        if sys.argv[2] not in ('true','false'): sys.exit('DEFAULT_FIREWALL_AUTO 必须是 true 或 false。')
+        print(sys.argv[2])
+PYCODE
+}
+
+set_firewall_auto() {
+  need_root
+  local value="${1:-}" current answer
+  current="$(firewall_auto)"
+  if [[ -z "$value" && -t 0 ]]; then
+    ui info "当前自动放行端口：$current；关闭后保留现有规则。"
+    read -r -p '1 开启，2 关闭，0 返回：' answer
+    case "$answer" in 1) value=true ;; 2) value=false ;; 0) return 0 ;; *) die '无效选择。' ;; esac
+  fi
+  [[ "$value" == true || "$value" == false ]] || die '用法：firewall-auto true|false。'
+  firewall_auto "$value" >/dev/null
+  success "自动放行端口：$value。设置立即保存，现有规则不变；下次应用配置时生效。"
+}
+
+firewall_status() {
+  need_root
+  local automatic
+  automatic="$(firewall_auto)"
+  ui title '防火墙状态'
+  ui info "脚本自动放行端口：$automatic"
+  python3 - "${1:-summary}" "$APP/firewall-owned.json" <<'PYCODE'
+import json, os, pathlib, shutil, subprocess, sys
+verbose=sys.argv[1]=='details';active=False;found=False
+
+def run(args, allowed=(0,)):
+    r=subprocess.run(args,text=True,capture_output=True,env={**os.environ,'LC_ALL':'C'})
+    if r.returncode not in allowed:
+        sys.stderr.write(r.stderr or r.stdout)
+        sys.exit('无法读取防火墙状态：'+args[0])
+    return r
+
+if shutil.which('ufw'):
+    found=True;r=run(['ufw','status']+(['verbose'] if verbose else []))
+    if 'Status: active' in r.stdout: active=True;print('UFW：已开启')
+    elif 'Status: inactive' in r.stdout: print('UFW：已关闭')
+    else: sys.exit('无法识别 UFW 状态。')
+    if verbose: print(r.stdout.rstrip())
+if shutil.which('firewall-cmd'):
+    found=True;r=run(['firewall-cmd','--state'],(0,252))
+    if r.returncode==0 and r.stdout.strip()=='running':
+        active=True;print('firewalld：已开启')
+        if verbose:
+            for mode in ([],['--permanent']):
+                print('持久规则：' if mode else '运行规则：')
+                print(run(['firewall-cmd',*mode,'--list-all-zones']).stdout.rstrip())
+    elif r.returncode==252 and 'not running' in r.stdout+r.stderr: print('firewalld：已关闭')
+    else: sys.exit('无法识别 firewalld 状态。')
+# Without a manager, show the actual raw rules rather than equating an installed tool with protection.
+if not active:
+    if shutil.which('nft'):
+        found=True;data=json.loads(run(['nft','-j','list','ruleset']).stdout)
+        entries=[x for x in data.get('nftables',[]) if any(k in x for k in ('table','chain','rule'))]
+        print(f'nftables：{len(entries)} 项表/链/规则（原始规则不提供一键开关）')
+        if verbose: print(json.dumps(data,indent=2,ensure_ascii=False))
+    if shutil.which('iptables'):
+        found=True;args=['iptables','-w','-S']+([] if verbose else ['INPUT'])
+        print('iptables：');print(run(args).stdout.rstrip())
+if not found: print('未检测到可用的防火墙管理工具。')
+p=pathlib.Path(sys.argv[2]);rules=json.loads(p.read_text()) if p.exists() else []
+print(f'本脚本记录的放行规则：{len(rules)} 条')
+if verbose:
+    print(json.dumps(rules,indent=2,ensure_ascii=False))
+    print('云安全组不在本机防火墙状态内，请在云平台查看。')
+PYCODE
+}
+
+firewall_system() {
+  need_root
+  local operation="${1:-}" backend="${2:-}" answer="${FIREWALL_CONFIRM:-}" choice output rc other
+  local -a managers=()
+  [[ "$operation" == enable || "$operation" == disable ]] || die '系统防火墙操作必须是 enable 或 disable。'
+  if command -v ufw >/dev/null; then managers+=(ufw); fi
+  if command -v firewall-cmd >/dev/null; then managers+=(firewalld); fi
+  (( ${#managers[@]} )) || die '仅支持 UFW/firewalld 系统开关；裸 nftables/iptables 请自行管理，脚本不会清空规则。'
+  if [[ -z "$backend" ]]; then
+    if (( ${#managers[@]} == 1 )); then backend="${managers[0]}"
+    elif [[ -t 0 ]]; then
+      for choice in "${!managers[@]}"; do ui item " $((choice+1)). ${managers[choice]}"; done
+      ui item ' 0. 返回'
+      read -r -p '选择系统防火墙：' choice
+      [[ "$choice" != 0 ]] || return 0
+      [[ "$choice" =~ ^[0-9]$ ]] && ((choice>=1 && choice<=${#managers[@]})) || die '无效选择。'
+      backend="${managers[choice-1]}"
+    else die '检测到多个管理工具，请指定 ufw 或 firewalld。'; fi
+  fi
+  case "$backend" in
+    ufw) command -v ufw >/dev/null || die 'UFW 未安装。' ;;
+    firewalld) command -v firewall-cmd >/dev/null || die 'firewalld 未安装。' ;;
+    *) die '系统开关仅支持 ufw 或 firewalld。' ;;
+  esac
+  if [[ "$operation" == enable ]]; then
+    if [[ "$backend" == ufw ]] && command -v firewall-cmd >/dev/null; then
+      if output="$(LC_ALL=C firewall-cmd --state 2>&1)"; then
+        die 'firewalld 已运行，请先关闭它后再启用 UFW。'
+      else rc=$?; [[ "$rc" == 252 && "$output" == *'not running'* ]] || die "无法读取 firewalld 状态：$output"; fi
+    elif [[ "$backend" == firewalld ]] && command -v ufw >/dev/null; then
+      output="$(LC_ALL=C ufw status)"
+      [[ "$output" != *'Status: active'* ]] || die 'UFW 已运行，请先关闭它后再启用 firewalld。'
+      [[ "$output" == *'Status: inactive'* ]] || die '无法读取 UFW 状态。'
+    fi
+  fi
+  ui warning "$operation $backend 会立即修改整台服务器的防火墙及其持久状态。启用前请确认 SSH 已放行；关闭会影响整机防护。"
+  if [[ -t 0 ]]; then read -r -p '确认此系统操作？输入 YES：' answer; fi
+  [[ "$answer" == YES ]] || die '未明确确认，系统防火墙保持不变；非交互操作需 FIREWALL_CONFIRM=YES。'
+  if [[ "$backend" == ufw ]]; then
+    ufw --force "$operation"
+    output="$(LC_ALL=C ufw status)"
+    if [[ "$operation" == enable ]]; then [[ "$output" == *'Status: active'* ]] || die 'UFW 未成功开启。'
+    else [[ "$output" == *'Status: inactive'* ]] || die 'UFW 未成功关闭。'; fi
+  else
+    systemctl "$operation" --now firewalld.service
+    if output="$(LC_ALL=C firewall-cmd --state 2>&1)"; then
+      [[ "$operation" == enable && "$output" == running ]] || die 'firewalld 未成功关闭。'
+    else
+      rc=$?; [[ "$operation" == disable && "$rc" == 252 && "$output" == *'not running'* ]] || die "firewalld 状态确认失败：$output"
+    fi
+  fi
+  success "$backend 系统防火墙已执行 $operation；脚本自动放行开关未改变。"
 }
 
 firewall_hints() {
@@ -1121,6 +1312,7 @@ require_no_pending() {
 
 apply_changes() {
   need_root
+  show_occupied_ports
   local pending="$APP/pending" old_vless old_hy2 old_anytls old_tuic old_vnet name staged=0 answer
   [[ -f "$CONFIG" ]] || die '请先安装节点。'
   if [[ -f "$pending/config.json" ]]; then
@@ -1143,6 +1335,8 @@ apply_changes() {
     read -r -p '确认应用并重启 sing-box 和已启用的脚本跳跃服务？输入 YES：' answer
     [[ "$answer" == YES ]] || return 0
   fi
+  local FW_PREVIOUS_ENDPOINTS
+  FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"
   load_node_settings
   old_vless="$VLESS_PORT" old_hy2="$HY2_PORT" old_anytls="$ANYTLS_PORT" old_tuic="$TUIC_PORT" old_vnet="$VLESS_NETWORK"
   begin_transaction update "$CONFIG" "$APP/tls" "$APP/client" "$APP/hopping.json" "$APP/firewall-owned.json" "$APP/manager.sh" "$MANAGER" "$HOP_UNIT_FILE" "$APP/runtime-state.json"
@@ -1221,6 +1415,50 @@ show_dashboard() {
   fi
 }
 
+menu_config() {
+  (
+    if [[ -f "$APP/pending/config.json" ]]; then APP="$APP/pending"; CONFIG="$APP/config.json"; fi
+    node_config "$@"
+  )
+}
+
+edit_inbound_field() {
+  local selected="$1" pointer="$2" value="${3-}" input
+  [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
+  node_config extract-inbound "$selected" > "$TEMP/field-original.json"
+  if (( $# < 3 )); then
+    [[ -t 0 ]] || die '请提供 JSON 值或 :remove。'
+    show_occupied_ports
+    ui info '输入 JSON 值（隐藏输入）；字符串需双引号，true/false 为开关；:remove 移除字段，:cancel 取消。'
+    read -r -s -p "${pointer}：" value || return 0
+    printf '\n' >&2
+    [[ "$value" != :cancel ]] || return 0
+  fi
+  input="$TEMP/field-edited.json"
+  FIELD_VALUE="$value" python3 - "$TEMP/field-original.json" "$input" "$pointer" <<'PYCODE'
+import json,os,pathlib,re,sys
+obj=json.loads(pathlib.Path(sys.argv[1]).read_text());pointer=sys.argv[3];value=os.environ['FIELD_VALUE']
+if not pointer.startswith('/') or re.search(r'~(?![01])',pointer): sys.exit('字段路径必须为 JSON Pointer，例如 /tls/handshake_timeout。')
+keys=[p.replace('~1','/').replace('~0','~') for p in pointer[1:].split('/')]
+try:
+    current=obj
+    for key in keys[:-1]:
+        if isinstance(current,list): current=current[int(key)]
+        else: current=current.setdefault(key,{})
+    key=keys[-1]
+    if isinstance(current,list):
+        if key=='-' and value!=':remove': current.append(json.loads(value))
+        elif value==':remove': del current[int(key)]
+        else: current[int(key)]=json.loads(value)
+    elif value==':remove': current.pop(key,None)
+    else: current[key]=json.loads(value)
+except (ValueError,IndexError,KeyError,TypeError,AttributeError) as error:
+    sys.exit('字段或 JSON 值无效：'+str(error))
+pathlib.Path(sys.argv[2]).write_text(json.dumps(obj,ensure_ascii=False,indent=2)+'\n')
+PYCODE
+  edit_protocol "$selected" "$input"
+}
+
 # Complete inbound JSON editing is validated by the installed core, not a field whitelist.
 edit_protocol() {
   need_root
@@ -1238,6 +1476,7 @@ edit_protocol() {
   fi
   [[ -n "$selected" ]] || die '用法：edit-protocol 协议标签 配置JSON文件。'
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
+  show_occupied_ports
   node_config extract-inbound "$selected" > "$TEMP/original-inbound.json"
   cp "$TEMP/original-inbound.json" "$TEMP/inbound.json"
   if [[ -z "$input" ]]; then
@@ -1306,7 +1545,11 @@ def inbound(tag):
     kind='vless' if tag=='vless-reality' else tag
     values=[i for i in c['inbounds'] if i.get('type')==kind]
     if not values: values=[i for i in c['inbounds'] if not i.get('type') and i.get('tag')==tag]
-    if len(values)!=1: sys.exit(f'配置中应存在且仅存在一个入站：{kind}')
+    if len(values)>1 and action=='load': return values[0]
+    if len(values)!=1:
+        if action in ('export','show','json','yaml','export-yaml'):
+            sys.stderr.write(f'{kind} 存在多个入站或缺少预置入站，当前无法自动生成完整客户端资料，请手动配置客户端。\n');sys.exit(3)
+        sys.exit(f'配置中应存在且仅存在一个入站：{kind}')
     return values[0]
 
 def new_inbound_tag(kind):
@@ -1316,8 +1559,12 @@ def new_inbound_tag(kind):
     return result
 
 def listener_conflict(left,right):
-    def network(item): return 'udp' if item.get('type') in ('hysteria2','tuic') or (item.get('transport') or {}).get('type')=='quic' else 'tcp'
-    if network(left)!=network(right): return False
+    def networks(item):
+        if (item.get('transport') or {}).get('type')=='quic': return {'udp'}
+        if item.get('network'): return {item['network']}
+        if item.get('type') in ('direct','shadowsocks'): return {'tcp','udp'}
+        return {'udp' if item.get('type') in ('hysteria','hysteria2','tuic') else 'tcp'}
+    if not networks(left)&networks(right): return False
     if left.get('listen_port')!=right.get('listen_port'): return False
     a,b=left.get('listen','::'),right.get('listen','::')
     if a==b or '::' in (a,b): return True
@@ -1343,6 +1590,58 @@ def atomic(path, text):
 def write_json(path, obj):
     atomic(path, json.dumps(obj, indent=2, ensure_ascii=False) + '\n')
 
+if action in ('menu-inbounds','menu-inbound','menu-fields','hopping-port','inbound-label'):
+    def emit(label,command): sys.stdout.write(label+'\0'+command+'\0')
+    def pointer_key(key): return str(key).replace('~','~0').replace('/','~1')
+    if action=='menu-inbounds':
+        for index,item in enumerate(c.get('inbounds',[])):
+            identifier=item.get('tag') or '@'+str(index)
+            emit(item.get('type','未知')+' · '+identifier,'inbound:@'+str(index))
+        sys.exit()
+    selector=sys.argv[2]
+    values=[item for index,item in enumerate(c.get('inbounds',[])) if '@'+str(index)==selector]
+    if not values: values=[item for item in c.get('inbounds',[]) if item.get('tag')==selector]
+    if len(values)!=1: sys.exit('请选择唯一的现有入站标签。')
+    item=values[0]
+    if action=='inbound-label':
+        print(item.get('type','未知')+' · '+(item.get('tag') or selector));sys.exit()
+    if action=='hopping-port':
+        if item.get('type')!='hysteria2': sys.exit('端口跳跃仅适用于 HY2 入站。')
+        print(item['listen_port']);sys.exit()
+    if action=='menu-inbound':
+        emit('完整编辑入站 JSON','edit-current')
+        emit('逐项修改字段 / 开关','group:')
+        emit('添加可选字段（JSON Pointer）','add-field')
+        if 'listen_port' in item: emit('修改监听端口','field:/listen_port')
+        if item.get('type')=='hysteria2':
+            # Hopping is implemented by the owned redirect service, not an inbound field.
+            hop=app/'hopping.json'
+            state=json.loads(hop.read_text()) if hop.exists() else {}
+            enabled=state.get('enabled',False)
+            owned=enabled and state.get('base_port')==item.get('listen_port')
+            emit('端口跳跃 · '+('开启' if owned else '由其他 HY2 入站使用' if enabled else '关闭'),'hopping')
+            if owned: emit('关闭端口跳跃','disable-hopping')
+        sys.exit()
+    pointer=sys.argv[3];value=item
+    if pointer:
+        for key in pointer[1:].split('/'):
+            key=key.replace('~1','/').replace('~0','~')
+            value=value[int(key)] if isinstance(value,list) else value[key]
+    entries=enumerate(value) if isinstance(value,list) else value.items() if isinstance(value,dict) else []
+    for key,child in entries:
+        path=pointer+'/'+pointer_key(key)
+        if isinstance(child,(dict,list)):
+            emit(str(key)+' · '+str(len(child))+' 项','group:'+path)
+        else:
+            state=('开启' if child else '关闭') if isinstance(child,bool) else 'null' if child is None else '数值' if isinstance(child,(int,float)) else '文本'
+            emit(str(key)+' · '+state,('switch:' if isinstance(child,bool) else 'field:')+path)
+    if pointer: emit('移除此字段（恢复内核默认或停用可选功能）','remove:'+pointer)
+    sys.exit()
+
+if action=='inbound-types':
+    print('\n'.join(dict.fromkeys(i.get('type','') for i in c.get('inbounds',[]))))
+    sys.exit()
+
 if action=='editable-protocols':
     for index,item in enumerate(c.get('inbounds',[])):
         identifier=item.get('tag') or '@'+str(index)
@@ -1351,8 +1650,9 @@ if action=='editable-protocols':
 
 if action in ('extract-inbound','replace-inbound'):
     selector=sys.argv[2]
-    matches=[(index,item) for index,item in enumerate(c.get('inbounds',[])) if item.get('tag')==selector]
-    if not matches: matches=[(index,item) for index,item in enumerate(c.get('inbounds',[])) if item.get('type')==selector or '@'+str(index)==selector]
+    matches=[(index,item) for index,item in enumerate(c.get('inbounds',[])) if '@'+str(index)==selector]
+    if not matches: matches=[(index,item) for index,item in enumerate(c.get('inbounds',[])) if item.get('tag')==selector]
+    if not matches: matches=[(index,item) for index,item in enumerate(c.get('inbounds',[])) if item.get('type')==selector]
     if len(matches)!=1: sys.exit('请选择唯一的现有入站标签。')
     index,old=matches[0]
     if action=='extract-inbound': print(json.dumps(old,indent=2,ensure_ascii=False));sys.exit()
@@ -1385,7 +1685,9 @@ if action in ('extract-inbound','replace-inbound'):
     write_json(p,c)
     hop_path=app/'hopping.json'
     if candidate.get('type')=='hysteria2' and hop_path.exists():
-        hop=json.loads(hop_path.read_text());hop['base_port']=candidate['listen_port'];write_json(hop_path,hop)
+        hop=json.loads(hop_path.read_text())
+        if hop['base_port']==old.get('listen_port'):
+            hop['base_port']=candidate['listen_port'];write_json(hop_path,hop)
     # A manually changed Reality private key requires a matching exported public key.
     reality=(candidate.get('tls') or {}).get('reality') or {}
     if candidate.get('type')=='vless' and reality.get('private_key')!=((old.get('tls') or {}).get('reality') or {}).get('private_key') and reality.get('enabled'):
@@ -1439,7 +1741,7 @@ if action in ('summary','record-runtime','protocols'):
     for item in c.get('inbounds',[]):
         kind = item.get('type',item.get('tag','未知协议'))
         label = labels.get(kind,item.get('tag',kind))
-        network = 'UDP' if (item.get('transport') or {}).get('type')=='quic' else item.get('network') or transports.get(kind,'端口')
+        network = 'UDP' if (item.get('transport') or {}).get('type')=='quic' else item.get('network') or ('TCP/UDP' if kind in ('direct','shadowsocks') else transports.get(kind,'端口'))
         if 'listen_port' in item: ports.append(f"{label}：{network.upper()} {item['listen_port']}")
     lines.append('    '.join(ports) or '未配置监听协议')
     for item in c.get('inbounds',[]):
@@ -1506,7 +1808,8 @@ hc = json.loads(hpath.read_text())
 hop_path = app/'hopping.json'
 hop = json.loads(hop_path.read_text()) if hop_path.exists() else {'enabled':False}
 if hop.get('enabled'):
-    if hop.get('version') != 1 or hop.get('base_port') != (int(os.environ['HY2_PORT']) if action=='update' and len(sys.argv)>2 and sys.argv[2]=='ports' else h['listen_port']) or not isinstance(hop.get('ports'),list) or not hop['ports']:
+    expected_ports={i['listen_port'] for i in c['inbounds'] if i.get('type')=='hysteria2'} if action=='load' else {int(os.environ['HY2_PORT']) if action=='update' and len(sys.argv)>2 and sys.argv[2]=='ports' else h['listen_port']}
+    if hop.get('version') != 1 or hop.get('base_port') not in expected_ports or not isinstance(hop.get('ports'),list) or not hop['ports']:
         sys.exit('跳跃配置与 HY2 监听端口不一致。')
 
 
@@ -2087,7 +2390,17 @@ export_nodes() {
 # Persist ownership so later port edits never remove an administrator's permits.
 update_firewall_ownership() {
   [[ ${STAGING:-0} != 1 ]] || return 0
+  if [[ "${1:-}" != restore && "${1:-}" != remove-all ]]; then
+    local automatic
+    automatic="$(firewall_auto)" || return
+    [[ "$automatic" == true ]] || return 0
+  fi
   FW_RESTORE="$TEMP/firewall-restore.json"
+  FW_CONFIG_ENDPOINTS=''
+  if [[ "${1:-}" != restore && "${1:-}" != remove-all && -f "$CONFIG" ]]; then
+    FW_CONFIG_ENDPOINTS="$(configuration_listeners)"
+  fi
+  export FW_CONFIG_ENDPOINTS FW_PREVIOUS_ENDPOINTS="${FW_PREVIOUS_ENDPOINTS-}"
   export APP TEMP FW_MARK FW_NFT FW_RESTORE VLESS_PORT HY2_PORT ANYTLS_PORT TUIC_PORT VLESS_NETWORK
   python3 - "$@" <<'PYCODE'
 import json, os, pathlib, subprocess, sys, tempfile
@@ -2199,6 +2512,9 @@ if len(sys.argv) in (3,4,5,6):
     previous = {(sys.argv[5] if len(sys.argv)==6 else 'tcp',int(sys.argv[1])),('udp',int(sys.argv[2]))}
     if len(sys.argv)>=4 and sys.argv[3]: previous.add(('tcp',int(sys.argv[3])))
     if len(sys.argv)>=5 and sys.argv[4]: previous.add(('udp',int(sys.argv[4])))
+    if os.environ.get('FW_CONFIG_ENDPOINTS'):
+        current={(parts[0],int(parts[1])) for line in os.environ['FW_CONFIG_ENDPOINTS'].splitlines() if len(parts:=line.split())>=2}
+        previous.update((parts[0],int(parts[1])) for line in os.environ.get('FW_PREVIOUS_ENDPOINTS','').splitlines() if len(parts:=line.split())>=2)
     retired = previous-current
     if not ledger.exists() and retired:
         print('提示：旧部署没有防火墙归属记录，已有旧端口规则将保留，请自行确认。', file=sys.stderr)
@@ -2377,12 +2693,16 @@ menu_action() {
 
 # Labels and actions share one list; numbering and dispatch follow that list.
 run_menu() {
-  local title="$1" header="$2" choice action index text count
+  local title="$1" header="$2" choice action index text count provider=''
   shift 2
   local -a entries=("$@")
-  count=$((${#entries[@]}/2))
+  if (( ${#entries[@]} == 1 )) && [[ "${entries[0]}" == @* ]]; then provider="${entries[0]#@}"; fi
   while true; do
-    printf '\n'; ui title "$title"
+    if [[ -n "$provider" ]]; then mapfile -d '' -t entries < <("$provider"); fi
+    count=$((${#entries[@]}/2))
+    printf '\n'; ui title "╭─ $title"
+    ui info '│ 选择编号操作 · 0 返回 / 退出'
+    ui info '╰────────────────────────────────────────'
     if [[ -n "$header" ]] && ! bash "$SCRIPT_PATH" "$header"; then ui warning '配置摘要读取失败，请查看状态和日志。'; fi
     text=''
     for ((index=0; index<${#entries[@]}; index+=2)); do
@@ -2397,28 +2717,90 @@ run_menu() {
       continue
     fi
     action="${entries[(10#$choice-1)*2+1]}"
-    if [[ "$action" == @* ]]; then "${action#@}"
-    else menu_action "$action"; fi
+    case "$action" in
+      inbound:*) protocol_submenu "${action#inbound:}" ;;
+      group:*) protocol_fields_menu "$ACTIVE_INBOUND" "${action#group:}" ;;
+      switch:*) protocol_switch_menu "$ACTIVE_INBOUND" "${action#switch:}" ;;
+      value:*) menu_action edit-field "$ACTIVE_INBOUND" "$ACTIVE_FIELD" "${action#value:}"; return 0 ;;
+      field:*) menu_action edit-field "$ACTIVE_INBOUND" "${action#field:}" ;;
+      remove:*) menu_action edit-field "$ACTIVE_INBOUND" "${action#remove:}" :remove; return 0 ;;
+      edit-current) menu_action edit-protocol "$ACTIVE_INBOUND" ;;
+      add-field) add_inbound_field "$ACTIVE_INBOUND" ;;
+      hopping) menu_action set-hopping "$ACTIVE_INBOUND" ;;
+      disable-hopping) menu_action disable-hopping "$ACTIVE_INBOUND" ;;
+      @*) "${action#@}" ;;
+      *) menu_action "$action" ;;
+    esac
   done
 }
 
+protocol_entries() { menu_config menu-inbounds; }
+protocol_field_entries() { menu_config menu-fields "$ACTIVE_INBOUND" "$ACTIVE_FIELD"; }
+protocol_action_entries() { menu_config menu-inbound "$ACTIVE_INBOUND"; }
+
 protocol_menu() {
-  run_menu '修改现有协议配置' '' \
-    '选择协议并完整编辑所有入站字段（JSON）' edit-protocol \
-    '修改监听端口' set-ports \
-    '修改协议 SNI' set-sni \
-    '修改协议凭据' set-credentials \
-    'Hysteria2 端口跳跃与占用端口排除' set-hopping \
-    'Hysteria2 BBR 拥塞控制档位' set-hy2-bbr \
-    '更新为当前脚本默认参数（TLS/HY2/TUIC）' set-protocol-defaults
+  run_menu '修改现有协议 · 按配置中的入站分组' protocol-edit-header @protocol_entries
+}
+
+protocol_submenu() {
+  local ACTIVE_INBOUND="$1" title
+  title="$(menu_config inbound-label "$ACTIVE_INBOUND")"
+  run_menu "$title · 协议配置" protocol-edit-header @protocol_action_entries
+}
+
+protocol_fields_menu() {
+  local ACTIVE_INBOUND="$1" ACTIVE_FIELD="$2" title
+  title="$(menu_config inbound-label "$ACTIVE_INBOUND")"
+  run_menu "$title${ACTIVE_FIELD} · 配置字段" '' @protocol_field_entries
+}
+
+protocol_switch_menu() {
+  local ACTIVE_INBOUND="$1" ACTIVE_FIELD="$2" title
+  title="$(menu_config inbound-label "$ACTIVE_INBOUND")"
+  run_menu "$title${ACTIVE_FIELD} · 开关" '' \
+    '开启 · true' value:true \
+    '关闭 · false' value:false \
+    '移除字段 · 使用内核默认值' value::remove
+}
+
+protocol_edit_header() {
+  if [[ -f "$APP/pending/config.json" ]]; then ui warning '编辑来源：待应用配置 · 保存后仍需手动应用'
+  else ui info '编辑来源：已保存配置 · 修改将写入待应用区'; fi
+}
+
+add_inbound_field() {
+  local selected="$1" pointer
+  read -r -p '字段 JSON Pointer（例如 /tls/handshake_timeout，0 返回）：' pointer || return 0
+  [[ "$pointer" != 0 ]] || return 0
+  menu_action edit-field "$selected" "$pointer"
+}
+
+protocol_creation_entries() {
+  local -a supported=('anytls' 'AnyTLS' 'add-anytls' 'tuic' 'TUIC' 'add-tuic')
+  local index installed=''
+  if [[ -f "$CONFIG" ]]; then installed="$(menu_config inbound-types)"; fi
+  for ((index=0; index<${#supported[@]}; index+=3)); do
+    if [[ $'\n'"$installed"$'\n' != *$'\n'"${supported[index]}"$'\n'* ]]; then
+      printf '%s\0%s\0' "生成 ${supported[index+1]} 入站" "${supported[index+2]}"
+    fi
+  done
+  printf '%s\0%s\0' \
+    '重新生成指定协议配置' regenerate \
+    '重新生成全部节点凭据（旧节点失效）' rotate-credentials \
+    '更新已有协议为当前脚本默认参数' set-protocol-defaults
 }
 
 protocol_creation_menu() {
-  run_menu '生成 / 重新生成协议' '' \
-    '生成 AnyTLS 入站' add-anytls \
-    '生成 TUIC 入站' add-tuic \
-    '重新生成指定协议配置' regenerate \
-    '重新生成全部节点凭据（旧节点失效）' rotate-credentials
+  run_menu '生成 / 重新生成协议' '' @protocol_creation_entries
+}
+
+firewall_menu() {
+  run_menu '防火墙 · 状态与开关' firewall-status \
+    '查看状态和完整规则详情' firewall-details \
+    '开启脚本自动放行端口（现有规则不变）' firewall-auto-on \
+    '关闭脚本自动放行端口（保留现有规则）' firewall-auto-off \
+    '开启系统防火墙（需确认）' firewall-enable \
+    '关闭系统防火墙（需确认）' firewall-disable
 }
 
 socks_menu() {
@@ -2448,10 +2830,10 @@ prepare_hopping() {
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
   local spec_input exclusion_input interval_input
   local occupied exclusion="${HY2_HOP_EXCLUDE:-auto}" spec="${HY2_HOP_PORTS:-}" interval="${HY2_HOP_INTERVAL:-$DEFAULT_HY2_HOP_INTERVAL}" backend
-  occupied="$(ss -H -lntup)"
+  show_occupied_ports
+  occupied="$OCCUPIED_PORTS"
   printf '%s\n' "$occupied" > "$TEMP/occupied.txt"
   if [[ -t 0 ]]; then
-    printf '\n当前已占用端口（TCP 与 UDP 分别判断）：\n%s\n' "${occupied:-无}"
     read -r -p "HY2 跳跃端口/区间，逗号分隔，0 关闭 [${spec:-关闭}]：" spec_input
     spec="${spec_input:-$spec}"
     if [[ -n "$spec" && "$spec" != 0 ]]; then
@@ -2594,8 +2976,8 @@ if c['enabled'] and action in ('start','validate') and pathlib.Path(sys.argv[3])
     config=json.loads(pathlib.Path(sys.argv[3]).read_text())
     for item in config.get('inbounds',[]):
         kind=item.get('type') or item.get('tag')
-        if kind=='hysteria2': continue
-        if kind in ('tuic','hysteria') or (item.get('transport') or {}).get('type')=='quic':
+        if kind=='hysteria2' and item.get('listen_port')==c['base_port']: continue
+        if kind in ('tuic','hysteria','hysteria2') or item.get('network')=='udp' or (kind in ('direct','shadowsocks') and not item.get('network')) or (item.get('transport') or {}).get('type')=='quic':
             port=item.get('listen_port')
             if type(port) is int and any(a<=port<=b for a,b in ranges):
                 sys.exit(f'{kind} UDP/{port} 与 HY2 跳跃端口冲突，请先从跳跃范围排除该端口。')
@@ -2651,6 +3033,10 @@ set_hopping() {
   [[ -f "$CONFIG" ]] || die '请先安装。'
   local requested="${HY2_HOP_PORTS_REQUEST:-}" interval="${HY2_HOP_INTERVAL_REQUEST:-}"
   load_node_settings
+  if [[ -n "${1:-}" ]]; then
+    HY2_PORT="$(node_config hopping-port "$1")"
+    ui info "本次端口跳跃目标：$1 · UDP/$HY2_PORT；单个跳跃服务同时管理一个 HY2 入站。"
+  fi
   HY2_HOP_PORTS="${requested:-$HY2_HOP_PORTS}"; HY2_HOP_INTERVAL="${interval:-$HY2_HOP_INTERVAL}"
   prepare_hopping
   hopping_runtime validate "$TEMP/hopping-plan.json"
@@ -2659,9 +3045,9 @@ set_hopping() {
   snapshot_hopping
   install_manager
   apply_hopping_plan
-  node_config export
+  export_client_files
   restart_checked
-  show_node_details
+  if [[ ! -f "$APP/client/EXPORT-ERROR.txt" ]]; then show_node_details; fi
   TRANSACTION=""
   if [[ ${STAGING:-0} != 1 ]]; then success '端口跳跃已更新；请重新导入客户端配置，并在云安全组开放上面列出的 UDP 跳跃端口。'; fi
 }
@@ -2907,8 +3293,10 @@ backup_cmd() {
 
 restore_backup() {
   need_root
+  show_occupied_ports
   require_no_pending
   [[ -x "$BIN" ]] || die '请先安装兼容的 sing-box 内核，再恢复配置。'
+  local FW_PREVIOUS_ENDPOINTS=''
   local source="${1:-${BACKUP_FILE:-}}" old_vless="" old_hy2="" old_anytls="" old_tuic="" old_vnet="tcp" answer
   if [[ -z "$source" && -t 0 ]]; then
     printf '\n已有备份：\n'; ls -1 "$BACKUP_DIR/"*.tar.gz 2>/dev/null || true
@@ -2929,7 +3317,9 @@ import json,sys
 c=json.load(open(sys.argv[1]))
 print(next(i['listen_port'] for i in c['inbounds'] if i.get('type')=='vless' or (not i.get('type') and i.get('tag')=='vless-reality')),next(i['listen_port'] for i in c['inbounds'] if i.get('type')=='hysteria2' or (not i.get('type') and i.get('tag')=='hysteria2')),next((i['listen_port'] for i in c['inbounds'] if i.get('type')=='anytls' or (not i.get('type') and i.get('tag')=='anytls')),'-'),next((i['listen_port'] for i in c['inbounds'] if i.get('type')=='tuic'),'-'),'udp' if any(i.get('type')=='vless' and (i.get('transport') or {}).get('type')=='quic' for i in c['inbounds']) else 'tcp')
 PYCODE
-)"; then read -r old_vless old_hy2 old_anytls old_tuic old_vnet <<< "$ports"
+)"; then
+      read -r old_vless old_hy2 old_anytls old_tuic old_vnet <<< "$ports"
+      FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"
       [[ "$old_anytls" != - ]] || old_anytls=""
       [[ "$old_tuic" != - ]] || old_tuic=""
     else log '当前配置已损坏，旧防火墙规则将保留。'; fi
@@ -3050,14 +3440,22 @@ main_menu() {
     '卸载' uninstall \
     '应用配置并重启' apply \
     '丢弃待应用修改' discard-pending \
-    '生成 / 重新生成协议' @protocol_creation_menu
+    '生成 / 重新生成协议' @protocol_creation_menu \
+    '防火墙状态 / 详情 / 开关' @firewall_menu
 }
 
 case "${1:-menu}" in
   menu) main_menu ;;
+  firewall-status) firewall_status ;;
+  firewall-details) firewall_status details ;;
+  firewall-auto) set_firewall_auto "${2:-}" ;;
+  firewall-auto-on) set_firewall_auto true ;;
+  firewall-auto-off) set_firewall_auto false ;;
+  firewall-enable) firewall_system enable "${2:-}" ;;
+  firewall-disable) firewall_system disable "${2:-}" ;;
   install) fresh_install ;;
   set-ports) stage_changes set_node ports ;;
-  set-hopping) stage_changes set_hopping ;;
+  set-hopping) stage_changes set_hopping "${2:-}" ;;
   set-hy2-bbr) stage_changes set_node bbr ;;
   update) kernel_update ;;
   backup) backup_cmd "${2:-}" ;;
@@ -3076,8 +3474,11 @@ case "${1:-menu}" in
   add-anytls) stage_changes set_node add-anytls ;;
   add-tuic) stage_changes set_node add-tuic ;;
   edit-protocol) stage_changes edit_protocol "${2:-}" "${3:-}" ;;
+  edit-field) if (( $# >= 4 )); then stage_changes edit_inbound_field "$2" "$3" "$4"; else stage_changes edit_inbound_field "${2:-}" "${3:-}"; fi ;;
+  disable-hopping) HY2_HOP_PORTS_REQUEST=0; stage_changes set_hopping "${2:-}" ;;
   set-protocol-defaults) stage_changes update_protocol_defaults ;;
   summary) show_dashboard ;;
+  protocol-edit-header) protocol_edit_header ;;
   apply) apply_changes ;;
   discard-pending) discard_pending ;;
   setup-manager) setup_manager ;;
