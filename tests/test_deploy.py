@@ -37,7 +37,7 @@ class DeployTests(unittest.TestCase):
 if [[ $1 == check ]]; then
   [[ ! -f "$TEST_ROOT/fail-check" ]] || exit 1
 elif [[ $1 == generate ]]; then
-  printf 'PrivateKey: test-private\\nPublicKey: test-public\\n'
+  printf 'PrivateKey: dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo\\nPublicKey: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo\\n'
 fi
 ''')
         self.bin.chmod(0o700)
@@ -62,6 +62,7 @@ else: sys.exit(1)
         self.prelude = f'''source {self.lib}
 export PATH={inactive}:"$PATH"
 BIN={self.bin}
+export SERVER_IP="${{SERVER_IP:-8.8.8.8}}"
 # Existing fixtures model deployments created before AnyTLS support.
 ANYTLS_PORT="${{ANYTLS_PORT_REQUEST:-}}"
 TUIC_PORT="${{TUIC_PORT_REQUEST:-}}"
@@ -176,7 +177,7 @@ set_socks_profile ai google
         self.assertEqual([o['server'] for o in config['outbounds']], ['old', 'old', 'new-other'])
         self.assertEqual(config['outbounds'][2]['password'], 'other-secret')
         self.assertIs(config['outbounds'][2]['tcp_fast_open'], True)
-        self.assertIn('Everything else: Other SOCKS5', info.read_text())
+        self.assertIn('其他 → SOCKS5 new-other:1082', info.read_text())
 
     def test_configure_all_three_profiles(self):
         self.old_config()
@@ -269,7 +270,8 @@ die 'injected install failure'
         self.assertFalse((self.root / 'enabled').exists())
 
     def test_update_display_failure_rolls_back(self):
-        original = self.old_config()
+        self.managed_node()
+        original = self.config.read_bytes()
         result = self.run_bash(self.update_body().replace('show_node_details() { :; }',
                                                         'show_node_details() { return 1; }'))
         self.assertNotEqual(result.returncode, 0)
@@ -378,7 +380,7 @@ show_node_details
         self.assertTrue(all(o['tcp_fast_open'] is True for o in config['outbounds'] if o['type'] == 'socks'))
         self.assertTrue(all(r['http_client']['detour'] == 'direct' for r in config['route']['rule_set']))
         self.assertNotIn('other-secret', result.stdout)
-        self.assertIn('else Other SOCKS5.', result.stdout)
+        self.assertIn('Everything else: Other SOCKS5', result.stdout)
         server = config['inbounds'][1]
         self.assertEqual(server['bbr_profile'],'standard')
         client = json.loads((self.app / 'client/hysteria2.outbound.json').read_text())
@@ -444,6 +446,116 @@ show_node_details
         text = (self.app/'client/proxies.yaml').read_text()
         self.assertNotIn('hop-interval:', text)
         self.assertNotIn('    ports:', text)
+
+    def test_check_connections_reads_arbitrary_socks_tags_without_managed_node_files(self):
+        self.config.parent.mkdir(parents=True)
+        config = {'inbounds':[], 'outbounds':[
+            {'type':'socks','tag':'custom-auth','server':'auth.example','server_port':19001,
+             'username':'actual-user','password':'actual-secret'},
+            {'type':'socks','tag':'custom-open','server':'open.example','server_port':19002},
+            {'type':'direct','tag':'direct'},
+            {'type':'socks','tag':'old-socks4','server':'v4.example','server_port':19003,'version':'4'}]}
+        self.config.write_text(json.dumps(config))
+        result=self.run_bash('''check_socks() {
+  python3 - <<'PYCODE'
+import json,os,pathlib
+p=pathlib.Path(os.environ['TEST_ROOT'])/'probes.jsonl'
+with p.open('a') as f: f.write(json.dumps([os.environ['PROBE_SOCKS_'+k] for k in ('HOST','PORT','USER','PASS')])+'\\n')
+PYCODE
+}
+load_node_settings() { die 'managed settings must not be read'; }
+check_reality_target() { die 'fixed Reality target must not be read'; }
+check_connections
+''',AI_SOCKS_HOST='wrong.example',AI_SOCKS_PORT='1080',AI_SOCKS_USER='wrong',AI_SOCKS_PASS='wrong')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rows=[json.loads(line) for line in (self.root/'probes.jsonl').read_text().splitlines()]
+        self.assertEqual(rows,[['auth.example','19001','actual-user','actual-secret'],['open.example','19002','','']])
+        self.assertIn('custom-auth',result.stderr)
+        self.assertIn('custom-open',result.stderr)
+        self.assertNotIn('actual-secret',result.stderr+result.stdout)
+        self.assertIn('跳过',result.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_check_socks_supports_no_auth_and_rejects_unexpected_method(self):
+        for accepted in (True,False):
+            with self.subTest(accepted=accepted),socket.socket() as listener:
+                listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
+                errors=[]
+                def serve():
+                    try:
+                        with listener.accept()[0] as conn:
+                            conn.settimeout(5)
+                            self.assertEqual(conn.recv(3),b'\x05\x01\x00')
+                            conn.sendall(b'\x05\x00' if accepted else b'\x05\x02')
+                            if accepted:
+                                self.assertTrue(conn.recv(1024).startswith(b'\x05\x01\x00\x03'))
+                                conn.sendall(b'\x05\x00\x00\x01'+bytes(6))
+                    except BaseException as exc: errors.append(exc)
+                thread=threading.Thread(target=serve,daemon=True);thread.start()
+                result=self.run_bash('check_socks probe',PROBE_SOCKS_HOST='127.0.0.1',
+                    PROBE_SOCKS_PORT=str(listener.getsockname()[1]),PROBE_SOCKS_USER='',PROBE_SOCKS_PASS='')
+                thread.join(6)
+                self.assertFalse(thread.is_alive());self.assertFalse(errors,errors)
+                self.assertEqual(result.returncode==0,accepted,result.stderr)
+        result=self.run_bash('check_socks probe',PROBE_SOCKS_HOST='127.0.0.1',PROBE_SOCKS_PORT='1',
+                             PROBE_SOCKS_USER='user',PROBE_SOCKS_PASS='')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('1-255',result.stderr)
+
+    def test_check_connections_uses_configured_certificates_and_reality_endpoint(self):
+        import shutil
+        self.config.parent.mkdir(parents=True)
+        cert=self.root/'external-public.crt';key=self.root/'external-private.key'
+        openssl=shutil.which('openssl')
+        subprocess.run([openssl,'req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256',
+                        '-nodes','-days','1','-keyout',str(key),'-out',str(cert),'-subj','/CN=certificate.example'],
+                       check=True,capture_output=True)
+        tools=self.root/'openssl-probe';tools.mkdir();fake=tools/'openssl'
+        fake.write_text('''#!/usr/bin/env python3
+import json,os,pathlib,sys
+args=sys.argv[1:]
+with (pathlib.Path(os.environ['TEST_ROOT'])/'openssl-args.jsonl').open('a') as f: f.write(json.dumps(args)+'\\n')
+if args[0]=='s_client':
+    assert '-verify_return_error' in args and '-tls1_3' in args
+    print('CONNECTION ESTABLISHED',file=sys.stderr)
+else: os.execv(os.environ['REAL_OPENSSL'],[os.environ['REAL_OPENSSL'],*args])
+''');fake.chmod(0o700)
+        self.config.write_text(json.dumps({'outbounds':[], 'inbounds':[
+            {'type':'anytls','tag':'external-file','tls':{'enabled':True,'certificate_path':str(cert)}},
+            {'type':'tuic','tag':'embedded','tls':{'enabled':True,'certificate':[cert.read_text()]}},
+            {'type':'vless','tag':'custom-reality','tls':{'enabled':True,'server_name':'certificate.example',
+                'reality':{'enabled':True,'handshake':{'server':'::1','server_port':18443}}}},
+            {'type':'anytls','tag':'dynamic','tls':{'enabled':True,'certificate_provider':'custom-provider'}},
+            {'type':'anytls','tag':'disabled-tls','tls':{'enabled':False,'certificate_path':'/must/not/read'}}]}))
+        result=self.run_bash(f'export PATH={tools}:"$PATH"\ncheck_connections',REAL_OPENSSL=openssl)
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=[json.loads(line) for line in (self.root/'openssl-args.jsonl').read_text().splitlines()]
+        self.assertEqual(len(calls),3)
+        self.assertIn(str(cert),calls[0]);self.assertNotIn('-in',calls[1])
+        self.assertEqual(calls[2][calls[2].index('-connect')+1],'[::1]:18443')
+        self.assertEqual(calls[2][calls[2].index('-servername')+1],'certificate.example')
+        self.assertIn('动态证书需在服务运行时核实',result.stderr)
+        self.assertNotIn('/must/not/read',result.stdout+result.stderr)
+        self.assertFalse(self.app.exists())
+
+    def test_check_connections_propagates_certificate_failures_without_fake_success(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'outbounds':[], 'inbounds':[
+            {'type':'anytls','tag':'actual','tls':{'enabled':True,'certificate_path':str(self.root/'missing.crt')}}]}))
+        result=self.run_bash('check_connections')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('TLS 证书无效',result.stderr)
+        self.assertNotIn('项目检查通过',result.stderr)
+
+    def test_check_connections_skips_absent_optional_protocols(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[],'outbounds':[{'type':'direct','tag':'only-direct'}]}))
+        result=self.run_bash('check_connections')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('未配置 SOCKS5',result.stderr)
+        self.assertIn('未配置 Reality',result.stderr)
+        self.assertFalse(self.app.exists())
 
     def test_output_colors_require_terminal_and_leave_yaml_plain(self):
         self.managed_node()
@@ -660,7 +772,7 @@ TRANSACTION=""
 
     def check_single_protocol_regeneration(self, protocol):
         original = self.managed_node(anytls=True)
-        self.bin.write_text(self.bin.read_text().replace('test-private','new-private').replace('test-public','new-public'))
+        self.bin.write_text(self.bin.read_text().replace('dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo','XasIfmJKikt54X-Lg4AO5m87sSkmGLb9HC-LJ_-I4Os').replace('hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo','3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08'))
         hop = {'version':1,'enabled':True,'backend':'nft','base_port':9443,
                'ports':['20000:20005'],'hop_interval':'10s'}
         (self.app/'hopping.json').write_text(json.dumps(hop))
@@ -690,7 +802,7 @@ set_node regenerate {protocol}
             self.assertNotEqual(changed['tls']['reality']['private_key'],old['tls']['reality']['private_key'])
             self.assertNotEqual(changed['tls']['reality']['short_id'],old['tls']['reality']['short_id'])
             client = json.loads((self.app/'client/vless-reality.outbound.json').read_text())
-            self.assertEqual(client['tls']['reality']['public_key'],'new-public')
+            self.assertEqual(client['tls']['reality']['public_key'],'3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08')
         else:
             stem = 'hy2' if protocol=='hysteria2' else 'anytls'
             allowed |= {f'deployment/tls/{stem}.crt',f'deployment/tls/{stem}.key',f'deployment/client/{stem}.crt'}
@@ -1163,6 +1275,149 @@ run_menu 动态菜单 '' @entries""",'1\n1\n0\n')
         rules=json.loads(self.firewall_state.read_text())['ufw']
         self.assertIn('ALLOW 12443/tcp',rules);self.assertIn('ALLOW 12443/udp',rules)
 
+    def test_config_only_edit_stage_and_apply_without_management_files(self):
+        self.config.parent.mkdir(parents=True)
+        original={'inbounds':[{'type':'direct','tag':'existing','listen':'127.0.0.1','listen_port':18443,'network':'tcp'}],'outbounds':[{'type':'direct','tag':'direct'}]}
+        self.config.write_text(json.dumps(original))
+        self.assertFalse(self.app.exists())
+        result=self.run_bash('stage_changes edit_inbound_field @0 /listen_port 18444')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][0]['listen_port'],18444)
+        self.assertTrue((self.root/'active').exists())
+        self.assertFalse((self.app/'pending').exists())
+
+    def test_missing_client_exports_are_rebuilt_entirely_from_config(self):
+        import shutil
+        config=self.managed_node(anytls=True,tuic=True)
+        shutil.rmtree(self.app/'client')
+        result=self.run_bash('load_node_settings\nnode_config export\nnode_config json')
+        self.assertEqual(result.returncode,0,result.stderr)
+        clients=json.loads(result.stdout)['outbounds']
+        self.assertEqual([i['type'] for i in clients],['vless','hysteria2','anytls','tuic'])
+        self.assertEqual(clients[0]['uuid'],config['inbounds'][0]['users'][0]['uuid'])
+        self.assertEqual(clients[0]['tls']['reality']['public_key'],'hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo')
+        self.assertEqual(clients[1]['password'],config['inbounds'][1]['users'][0]['password'])
+        for file in (self.app/'client').iterdir():
+            if file.is_file(): self.assertEqual(file.stat().st_mode&0o777,0o600)
+        (self.app/'client/vless-reality.outbound.json').write_text('broken cached JSON')
+        result=self.run_bash('node_config json')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['outbounds'],clients)
+
+    def test_single_protocol_inline_tls_config_without_any_app_exports(self):
+        import shutil
+        config=self.managed_node(anytls=True)
+        item=config['inbounds'][2]
+        item['tls']['certificate']=(self.app/'tls/anytls.crt').read_text()
+        item['tls']['key']=(self.app/'tls/anytls.key').read_text()
+        item['tls'].pop('certificate_path');item['tls'].pop('key_path')
+        only={'inbounds':[item],'outbounds':[{'type':'direct'}]}
+        self.config.write_text(json.dumps(only));shutil.rmtree(self.app)
+        result=self.run_bash('node_config json')
+        self.assertEqual(result.returncode,0,result.stderr)
+        clients=json.loads(result.stdout)['outbounds']
+        self.assertEqual(len(clients),1);self.assertEqual(clients[0]['type'],'anytls')
+        self.assertEqual(clients[0]['password'],item['users'][0]['password'])
+        self.assertFalse(self.app.exists())
+        result=self.run_bash('stage_changes edit_inbound_field @0 /listen_port 19444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        self.assertEqual(current['inbounds'][0]['listen_port'],19444)
+        self.assertEqual(current['inbounds'][0]['tls'],item['tls'])
+
+    def test_external_tls_paths_survive_missing_app_edit_and_apply(self):
+        import shutil
+        config=self.managed_node()
+        item=config['inbounds'][1]
+        cert=self.root/'external.crt';key=self.root/'external.key'
+        cert.write_bytes((self.app/'tls/hy2.crt').read_bytes());key.write_bytes((self.app/'tls/hy2.key').read_bytes())
+        before=(cert.read_bytes(),key.read_bytes())
+        item['tls'].update(certificate_path=str(cert),key_path=str(key))
+        self.config.write_text(json.dumps({'inbounds':[item],'outbounds':[{'type':'direct'}]}))
+        shutil.rmtree(self.app)
+        result=self.run_bash('stage_changes edit_inbound_field @0 /listen_port 19444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((cert.read_bytes(),key.read_bytes()),before)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][0]['tls']['certificate_path'],str(cert))
+
+    def test_config_only_failed_stage_preserves_original_and_can_restart(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[{'type':'direct','tag':'existing','listen_port':18443}],'outbounds':[{'type':'direct'}]}))
+        before=self.config.read_bytes();(self.root/'fail-check').touch()
+        result=self.run_bash('stage_changes edit_inbound_field @0 /listen_port 18444')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.config.read_bytes(),before);self.assertFalse((self.app/'pending').exists())
+        (self.root/'fail-check').unlink()
+        result=self.run_bash('service_cmd restart')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.root/'active').exists())
+        self.assertFalse((self.app/'client').exists())
+
+    def test_socks_changes_do_not_require_exported_node_info(self):
+        import shutil
+        self.managed_node();shutil.rmtree(self.app/'client')
+        result=self.run_bash(self.update_body())
+        self.assertEqual(result.returncode,0,result.stderr)
+        out={o.get('tag'):o for o in json.loads(self.config.read_text())['outbounds']}
+        self.assertEqual(out['ai-socks']['server'],'new-ai')
+        self.assertEqual(out['google-socks']['server'],'new-google')
+
+    def test_optional_export_missing_openssl_does_not_require_management_files(self):
+        self.managed_node()
+        fake=self.root/'python-fakes';fake.mkdir()
+        (fake/'subprocess.py').write_text('def run(*args, **kwargs):\n    raise FileNotFoundError("openssl unavailable")\n')
+        original=self.config.read_bytes()
+        result=self.run_bash('export_client_files',PYTHONPATH=str(fake))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(self.config.read_bytes(),original)
+        self.assertIn('openssl',(self.app/'client/EXPORT-ERROR.txt').read_text())
+
+    def test_tuic_config_with_omitted_password_exports_without_client_seed(self):
+        import shutil
+        config=self.managed_node(tuic=True)
+        item=config['inbounds'][2];item['users'][0].pop('password')
+        self.config.write_text(json.dumps({'inbounds':[item],'outbounds':[{'type':'direct'}]}))
+        shutil.rmtree(self.app/'client')
+        result=self.run_bash('node_config json')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['outbounds'][0]['password'],'')
+        self.assertFalse((self.app/'client').exists())
+
+    def test_missing_export_address_does_not_block_valid_config_changes(self):
+        config=self.managed_node(anytls=True)
+        self.config.write_text(json.dumps({'inbounds':[config['inbounds'][2]],'outbounds':[{'type':'direct'}]}))
+        result=self.run_bash('SERVER_IP=""\ncurl() { echo UNEXPECTED_NETWORK >&2; return 1; }\nstage_changes edit_inbound_field @0 /listen_port 19444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn('UNEXPECTED_NETWORK',result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][0]['listen_port'],19444)
+        self.assertIn('SERVER_IP',(self.app/'client/EXPORT-ERROR.txt').read_text())
+
+    def test_unwritable_client_output_does_not_roll_back_valid_server_edit(self):
+        self.managed_node()
+        external=self.root/'untouched-client-file';external.write_text('keep external file')
+        exported=self.app/'client/vless-reality.outbound.json';exported.unlink();exported.symlink_to(external)
+        result=self.run_bash('stage_changes edit_inbound_field @1 /listen_port 19444\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('客户端资料导出失败',result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][1]['listen_port'],19444)
+        self.assertEqual(external.read_text(),'keep external file')
+        self.assertTrue((self.root/'active').exists())
+
+    def test_backup_ignores_disposable_client_output_cache(self):
+        import tarfile
+        self.managed_node()
+        (self.app/'client/broken-cache').symlink_to(self.config)
+        result=self.run_bash('backup_cmd')
+        self.assertEqual(result.returncode,0,result.stderr)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        with tarfile.open(archive) as handle:
+            self.assertFalse(any(name.startswith('client/') for name in handle.getnames()))
+            self.assertIn('config.json',handle.getnames())
+
     def test_hy2_bbr_edit_is_staged_without_rotating_credentials(self):
         config = self.managed_node(anytls=True)
         config['inbounds'][1].pop('bbr_profile')
@@ -1539,6 +1794,9 @@ fi
 write_jsons
 ''', ANYTLS_PORT='10443' if anytls else '', TUIC_PORT='11443' if tuic else '')
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The generated configuration references these downloaded bootstrap resources.
+        for name in ('ai','google','youtube'):
+            (self.app/'rules'/f'{name}.srs').write_bytes(b'test-rule-'+name.encode())
         return json.loads(self.config.read_text())
 
     def file_snapshot(self):
@@ -1733,16 +1991,16 @@ write_jsons
     def test_rotation_is_explicit_and_syncs_reality_public_key(self):
         before=self.managed_node()
         self.bin.write_text('''#!/bin/bash
-if [[ $1 == generate ]]; then printf 'PrivateKey: rotated-private\\nPublicKey: rotated-public\\n'; fi
+if [[ $1 == generate ]]; then printf 'PrivateKey: XasIfmJKikt54X-Lg4AO5m87sSkmGLb9HC-LJ_-I4Os\\nPublicKey: 3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08\\n'; fi
 ''')
         result=self.run_bash('set_node rotate')
         self.assertEqual(result.returncode,0,result.stderr)
         after=json.loads(self.config.read_text())
         self.assertNotEqual(before['inbounds'][0]['users'][0]['uuid'],after['inbounds'][0]['users'][0]['uuid'])
         self.assertNotEqual(before['inbounds'][1]['users'][0]['password'],after['inbounds'][1]['users'][0]['password'])
-        self.assertEqual(after['inbounds'][0]['tls']['reality']['private_key'],'rotated-private')
+        self.assertEqual(after['inbounds'][0]['tls']['reality']['private_key'],'XasIfmJKikt54X-Lg4AO5m87sSkmGLb9HC-LJ_-I4Os')
         client=json.loads((self.app/'client/vless-reality.outbound.json').read_text())
-        self.assertEqual(client['tls']['reality']['public_key'],'rotated-public')
+        self.assertEqual(client['tls']['reality']['public_key'],'3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08')
         self.assertEqual(client['tls']['reality']['short_id'],after['inbounds'][0]['tls']['reality']['short_id'][0])
         self.assertEqual(after['route'],before['route'])
 
@@ -2186,6 +2444,111 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
         self.assertEqual(unit.read_text(),'Description=other administrator service\n')
         self.assertEqual(json.loads(self.nat_state.read_text())['batch'],'')
 
+    def test_backup_restore_config_only_without_app_or_hysteria2(self):
+        import tarfile
+        self.config.parent.mkdir(parents=True)
+        config={'inbounds':[{'type':'socks','tag':'local-socks','listen':'127.0.0.1','listen_port':1080}],
+                'outbounds':[{'type':'direct','tag':'direct'}]}
+        self.config.write_text(json.dumps(config));original=self.config.read_bytes()
+        result=self.run_bash('backup_cmd')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(self.app.exists());self.assertEqual(self.config.read_bytes(),original)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        with tarfile.open(archive) as f:
+            self.assertEqual(set(f.getnames()),{'config.json','manifest.json'})
+        config['inbounds'][0]['listen_port']=1081;self.config.write_text(json.dumps(config))
+        result=self.run_bash('restore_backup "'+str(archive)+'"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['inbounds'][0]['listen_port'],1080)
+        self.assertFalse((self.app/'hopping.json').exists())
+        self.assertFalse((self.root/'units/sing-box-hopping.service').exists())
+
+    def test_backup_copies_external_cert_symlink_and_rule_bytes_without_touching_sources(self):
+        import tarfile
+        self.config.parent.mkdir(parents=True);external=self.root/'external';external.mkdir()
+        cert=external/'fullchain.pem';key=external/'privkey.pem'
+        subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
+                        '-subj','/CN=example.com','-keyout',str(key),'-out',str(cert)],check=True,capture_output=True)
+        link=external/'cert.pem';link.symlink_to(cert)
+        local=external/'local.json';initial=external/'initial.json'
+        local.write_text('{"version":3,"rules":[{"domain":["example.com"]}]}')
+        initial.write_text('{"version":3,"rules":[{"domain":["initial.example.com"]}]}')
+        config={'inbounds':[{'type':'anytls','tag':'custom-anytls','listen':'::','listen_port':10443,
+                            'users':[{'password':'external-auth'}],
+                            'tls':{'enabled':True,'server_name':'example.com','certificate_path':str(link),'key_path':str(key)}}],
+                'outbounds':[{'type':'direct','tag':'direct'}],
+                'route':{'rule_set':[{'type':'local','tag':'local','format':'source','path':str(local)},
+                                     {'type':'remote','tag':'remote','format':'source','url':'https://example.com/rules.json','initial_path':str(initial)}]}}
+        self.config.write_text(json.dumps(config));before=self.config.read_bytes()
+        expected={path:path.read_bytes() for path in (cert,key,local,initial)}
+        result=self.run_bash('backup_cmd')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(self.app.exists());self.assertEqual(self.config.read_bytes(),before)
+        self.assertTrue(link.is_symlink())
+        for path,data in expected.items(): self.assertEqual(path.read_bytes(),data)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        with tarfile.open(archive) as f:
+            archived=json.load(f.extractfile('config.json'))
+            self.assertEqual(len([n for n in f.getnames() if n.startswith('tls/imported-')]),2)
+            self.assertEqual(len([n for n in f.getnames() if n.startswith('rules/imported-')]),2)
+            self.assertNotEqual(archived['inbounds'][0]['tls']['certificate_path'],str(link))
+            self.assertTrue(all(member.isfile() for member in f.getmembers()))
+        # Prove that restore uses archived copies, never writes to the original external locations.
+        for path in expected: path.unlink()
+        result=self.run_bash('restore_backup "'+str(archive)+'"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        restored=json.loads(self.config.read_text());tls=restored['inbounds'][0]['tls']
+        self.assertEqual(Path(tls['certificate_path']).read_bytes(),expected[cert])
+        self.assertEqual(Path(tls['key_path']).read_bytes(),expected[key])
+        rules=restored['route']['rule_set']
+        self.assertEqual(Path(rules[0]['path']).read_bytes(),expected[local])
+        self.assertEqual(Path(rules[1]['initial_path']).read_bytes(),expected[initial])
+        self.assertTrue(link.is_symlink())
+        for path in expected: self.assertFalse(path.exists())
+
+    def test_restore_without_hy2_stops_owned_hopping_without_fake_metadata(self):
+        import shutil
+        self.config.parent.mkdir(parents=True)
+        config={'inbounds':[{'type':'socks','tag':'only-socks','listen':'127.0.0.1','listen_port':1080}],
+                'outbounds':[{'type':'direct'}]}
+        self.config.write_text(json.dumps(config))
+        result=self.run_bash('backup_cmd');self.assertEqual(result.returncode,0,result.stderr)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        shutil.rmtree(self.config.parent)
+        self.managed_node();self.setup_nat()
+        result=self.run_bash('set_hopping',HY2_HOP_PORTS='20000:20005')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('restore_backup "'+str(archive)+'"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),config)
+        self.assertEqual(json.loads(self.nat_state.read_text())['batch'],'')
+        self.assertFalse((self.app/'hopping.json').exists())
+        self.assertFalse((self.root/'units/sing-box-hopping.service').exists())
+        self.assertFalse((self.root/'hop-enabled').exists());self.assertFalse((self.root/'hop-active').exists())
+
+    def test_config_only_restore_failure_rolls_back_without_leaving_app(self):
+        self.config.parent.mkdir(parents=True)
+        config={'inbounds':[{'type':'socks','tag':'local','listen':'127.0.0.1','listen_port':1080}],
+                'outbounds':[{'type':'direct'}]}
+        self.config.write_text(json.dumps(config));(self.root/'active').touch()
+        result=self.run_bash('backup_cmd');self.assertEqual(result.returncode,0,result.stderr)
+        archive=next((self.root/'backups').glob('*.tar.gz'))
+        config['inbounds'][0]['listen_port']=1081;self.config.write_text(json.dumps(config));before=self.config.read_bytes()
+        (self.root/'fail-restart').touch()
+        result=self.run_bash('restore_backup "'+str(archive)+'"')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.config.read_bytes(),before);self.assertFalse(self.app.exists())
+        self.assertTrue((self.root/'active').exists())
+
+    def test_backup_missing_external_resource_fails_without_modifying_config(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[{'type':'anytls','tls':{'certificate_path':str(self.root/'missing.pem')}}]}))
+        before=self.config.read_bytes();result=self.run_bash('backup_cmd')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('备份引用的资源不存在',result.stderr)
+        self.assertEqual(self.config.read_bytes(),before);self.assertFalse(self.app.exists())
+        self.assertEqual(list((self.root/'backups').glob('*.tar.gz')),[])
+
     def test_backup_roundtrip_restores_credentials_and_retains_live_firewall_ledger(self):
         import tarfile
         original=self.managed_node()
@@ -2250,7 +2613,7 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
         target=self.root/'existing.tar.gz';target.write_text('keep')
         result=self.run_bash('backup_cmd "'+str(target)+'"')
         self.assertNotEqual(result.returncode,0);self.assertEqual(target.read_text(),'keep')
-        (self.app/'client/symlink').symlink_to(self.config)
+        (self.app/'rules/symlink').symlink_to(self.config)
         result=self.run_bash('backup_cmd')
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(list((self.root/'backups').glob('*.tar.gz')),[])
@@ -2319,6 +2682,7 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
     def test_uninstall_backup_survives_and_only_owned_items_are_removed(self):
         import tarfile
         self.setup_uninstall_fixture(anytls=True)
+        original=json.loads(self.config.read_text())
         admin=(self.config.parent/'admin-extra.json').read_bytes()
         result=self.run_bash('uninstall_cmd',UNINSTALL_CONFIRM='YES')
         self.assertEqual(result.returncode,0,result.stderr)
@@ -2341,8 +2705,8 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
             self.assertIn('config.json',names)
             self.assertIn('tls/hy2.key',names)
             self.assertIn('tls/anytls.key',names)
-            self.assertIn('client/anytls.outbound.json',names)
-            self.assertIn('client/vless-reality.outbound.json',names)
+            self.assertFalse(any(name.startswith('client/') for name in names))
+            self.assertEqual(json.load(archive.extractfile('config.json')),original)
             self.assertNotIn('firewall-owned.json',names)
             self.assertNotIn('manager.sh',names)
         remove=[a for a in self.package_commands() if a[0]=='apt-get' and 'remove' in a and '-s' not in a]

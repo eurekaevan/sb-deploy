@@ -75,6 +75,7 @@ HOP_TRANSACTION=0
 HOP_WAS_ACTIVE=0
 HOP_WAS_ENABLED=0
 PACKAGE_ROLLBACK=0
+CLIENT_EXPORT_FAILED=0
 OLD_PACKAGE=""
 OLD_PACKAGE_ID=""
 FW_MARK="sing-box-deploy-$BASHPID"
@@ -229,6 +230,7 @@ usage() {
   disable-hopping      暂存关闭 HY2 跳跃规则，保存后需 apply
   edit-protocol [标签] [JSON文件]  完整编辑现有入站所有字段；交互时调用 EDITOR
   set-protocol-defaults 更新已有协议的 TLS 10s、HY2 ignore_client_bandwidth 及 TUIC 默认参数
+  SERVER_IP=公网地址    可覆盖客户端导出地址；不写回服务端配置
   export-yaml          可选导出 Clash/Mihomo proxies.yaml；普通生成/导出只在结果中显示 YAML
   set-hy2-bbr          设置 HY2 BBR 档位，默认 standard；可传 HY2_BBR_PROFILE；保存后需 apply
   set-hopping          HY2 端口跳跃，支持 HY2_HOP_PORTS、HY2_HOP_EXCLUDE、HY2_HOP_INTERVAL
@@ -252,7 +254,9 @@ usage() {
 源码顶部 DEFAULT_* 是首次安装默认值，环境变量优先，交互输入可覆盖。
 端口、TFO 等默认值读取源码顶部 DEFAULT_* 与环境变量；普通修改沿用当前值并保留未选择的凭据。
 协议、SOCKS 和跳跃设置的修改仅保存到待应用区，执行 apply 才更新服务、防火墙和跳跃规则。
-普通 show/export 查看已应用资料；待应用节点资料位于 deployment/pending/client，应用前不要导入。
+config.json 是节点配置依据；client 目录仅为可删除、可重新生成的导出结果，不参与读取服务端设置。
+普通 show/export 从已保存配置即时生成资料；通配监听地址无法直接确定公网地址，显式导出时可探测或用 SERVER_IP 指定。
+待应用修改及其导出结果位于 deployment/pending，应用前不要导入。
 安装支持 AI_SOCKS_*、GOOGLE_SOCKS_*、OTHER_SOCKS_*、SERVER_IP 等环境变量。
 请勿把密码放入命令参数或公开日志；填写凭据后的源码也应妥善保护。
 UFW/firewalld 放行规则持久化；裸 nftables/iptables 仅当前运行时生效。
@@ -400,7 +404,8 @@ import os, socket, struct, sys
 prefix = os.environ['SOCKS_PROFILE'].upper() + '_SOCKS'
 e = os.environ
 user, password = (e[prefix + suffix].encode() for suffix in ('_USER', '_PASS'))
-if not (1 <= len(user) <= 255 and 1 <= len(password) <= 255):
+authenticated = bool(user or password)
+if authenticated and not (1 <= len(user) <= 255 and 1 <= len(password) <= 255):
     sys.exit('SOCKS5 username/password must each contain 1-255 UTF-8 bytes.')
 def receive(sock, size):
     data = b''
@@ -412,12 +417,14 @@ def receive(sock, size):
     return data
 try:
     with socket.create_connection((e[prefix+'_HOST'], int(e[prefix+'_PORT'])), timeout=10) as sock:
-        sock.sendall(b'\x05\x01\x02')
-        if receive(sock, 2) != b'\x05\x02':
-            raise ValueError('upstream did not accept username/password authentication')
-        sock.sendall(b'\x01' + bytes([len(user)]) + user + bytes([len(password)]) + password)
-        if receive(sock, 2) != b'\x01\x00':
-            raise ValueError('authentication rejected')
+        method = b'\x02' if authenticated else b'\x00'
+        sock.sendall(b'\x05\x01' + method)
+        if receive(sock, 2) != b'\x05' + method:
+            raise ValueError('upstream did not accept the configured authentication method')
+        if authenticated:
+            sock.sendall(b'\x01' + bytes([len(user)]) + user + bytes([len(password)]) + password)
+            if receive(sock, 2) != b'\x01\x00':
+                raise ValueError('authentication rejected')
         host = b'example.com'
         sock.sendall(b'\x05\x01\x00\x03' + bytes([len(host)]) + host + struct.pack('!H', 443))
         version, reply, reserved, atyp = receive(sock, 4)
@@ -622,32 +629,12 @@ if e.get('TUIC_PORT'):
                'certificate_path':str(p/'tls/tuic.crt'),'key_path':str(p/'tls/tuic.key')}})
 for item in config['inbounds']:
     item['tls']['handshake_timeout']=e['DEFAULT_TLS_HANDSHAKE_TIMEOUT']
-cert = (p/'tls/hy2.crt').read_text()
-clients = {
- 'vless-reality.outbound.json': {
-   'type':'vless','tag':'vless-reality','server':e['SERVER_IP'],'server_port':int(e['VLESS_PORT']),
-   'uuid':e['UUID'],'flow':'xtls-rprx-vision',
-   'tls':{'enabled':True,'server_name':e['REALITY_DOMAIN'],
-          'utls':{'enabled':True,'fingerprint':'chrome'},
-          'reality':{'enabled':True,'public_key':e['REALITY_PUBLIC'],'short_id':e['SHORT_ID']}}
- },
- 'hysteria2.outbound.json': {
-   'type':'hysteria2','tag':'hysteria2','server':e['SERVER_IP'],'server_port':int(e['HY2_PORT']),
-   'password':e['HY2_PASS'],
-   'obfs':{'type':'salamander','password':e['HY2_OBFS_PASS']},
-   'tls':{'enabled':True,'server_name':e['REALITY_DOMAIN'],'alpn':['h3'],
-          'insecure':False,'certificate':cert}
- }
-}
 def write(path,contents):
     path.write_text(contents)
     path.chmod(0o600)
 def write_json(path,obj):
     write(path,json.dumps(obj,indent=2,ensure_ascii=False)+'\n')
 write_json(pathlib.Path(e['CONFIG']),config)
-for name, obj in clients.items():
-    obj['tls']['handshake_timeout']=e['DEFAULT_TLS_HANDSHAKE_TIMEOUT']
-    write_json(p/'client'/name,obj)
 
 PYCODE
   check_configuration || die 'sing-box check failed. Service was not started.'
@@ -927,12 +914,13 @@ for item in json.load(sys.stdin)["nftables"]:
 
 # This preference changes future port management, never existing rules or the service.
 firewall_auto() {
-  python3 - "$APP/firewall-settings.json" "$DEFAULT_FIREWALL_AUTO" "${1:-}" <<'PYCODE'
+  python3 - "$APP/firewall-settings.json" "$DEFAULT_FIREWALL_AUTO" "${1:-}" "$CONFIG" <<'PYCODE'
 import json, os, pathlib, sys, tempfile
 p=pathlib.Path(sys.argv[1]);value=sys.argv[3]
 if value:
     if value not in ('true','false'): sys.exit('自动放行开关必须是 true 或 false。')
-    if not p.parent.is_dir(): sys.exit('请先安装节点，再设置自动放行端口。')
+    if not pathlib.Path(sys.argv[4]).is_file(): sys.exit('配置文件不存在，无法设置自动放行端口。')
+    p.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     if p.is_symlink(): sys.exit('拒绝覆盖防火墙设置符号链接。')
     with tempfile.NamedTemporaryFile(mode='w',dir=p.parent,prefix='.firewall-settings-',delete=False) as f:
         temporary=pathlib.Path(f.name)
@@ -1163,14 +1151,14 @@ fresh_install() {
 # One transaction covers validation, atomic replacement and service restart.
 set_socks_profile() {
   need_root
-  [[ -f "$CONFIG" && -x "$BIN" && -f "$APP/client/node-info.txt" ]] || die 'First run install.'
+  [[ -f "$CONFIG" && -x "$BIN" ]] || die '需要现有 config.json 和可执行的 sing-box 内核。'
   local profile
   for profile in "$@"; do
     read_socks_profile "$profile"
     check_socks "$profile"
   done
   check_configuration
-  begin_transaction update "$CONFIG" "$APP/client/node-info.txt"
+  begin_transaction update "$CONFIG" "$APP/client"
   export CONFIG APP SOCKS_TFO REQUEST_SOCKS_TFO
   python3 - "$@" <<'PYCODE'
 import json, os, pathlib, sys, tempfile
@@ -1207,10 +1195,7 @@ with tempfile.NamedTemporaryFile(mode='w', dir=p.parent, prefix='.config-', dele
     finally:
         if staging.exists():
             staging.unlink()
-if 'other' in sys.argv[1:]:
-    info = pathlib.Path(os.environ['APP'])/'client/node-info.txt'
-    info.write_text(info.read_text().replace('Everything else: direct; private IPs rejected',
-                                           'Everything else: Other SOCKS5; private IPs rejected'))
+
 PYCODE
   forget_socks
   check_configuration
@@ -1222,13 +1207,15 @@ PYCODE
     die 'Service failed after configuration update.'
   fi
   fi
-  show_node_details
+  export_client_files
+  if [[ ! -f "$APP/client/EXPORT-ERROR.txt" ]]; then show_node_details; fi
   TRANSACTION=""
   if [[ ${STAGING:-0} != 1 ]]; then log 'Configuration updated, checked and service restarted.'; fi
 }
 
 show_node_details() {
   need_root
+  [[ ${CLIENT_EXPORT_FAILED:-0} != 1 ]] || return 0
   node_config show
 }
 
@@ -1271,7 +1258,7 @@ PYCODE
 
 stage_changes() {
   need_root
-  [[ -f "$CONFIG" && -d "$APP/client" ]] || die '请先安装节点。'
+  [[ -f "$CONFIG" ]] || die "配置文件不存在：$CONFIG"
   local pending="$APP/pending" name existed=0 before
   [[ ! -d "$pending" ]] || existed=1
   begin_transaction files "$pending"
@@ -1279,7 +1266,7 @@ stage_changes() {
     install -d -m 0700 "$pending"
     for name in tls client; do
       [[ ! -L "$APP/$name" ]] || die '拒绝暂存符号链接目录。'
-      cp -a "$APP/$name" "$pending/$name"
+      if [[ -d "$APP/$name" ]]; then cp -a "$APP/$name" "$pending/$name"; else install -d -m 0700 "$pending/$name"; fi
     done
     sha256sum "$CONFIG" | cut -d ' ' -f1 > "$pending/base.sha256"
     cp -a "$CONFIG" "$pending/config.json"
@@ -1313,7 +1300,7 @@ require_no_pending() {
 apply_changes() {
   need_root
   show_occupied_ports
-  local pending="$APP/pending" old_vless old_hy2 old_anytls old_tuic old_vnet name staged=0 answer
+  local pending="$APP/pending" name staged=0 answer
   [[ -f "$CONFIG" ]] || die '请先安装节点。'
   if [[ -f "$pending/config.json" ]]; then
     staged=1
@@ -1337,8 +1324,6 @@ apply_changes() {
   fi
   local FW_PREVIOUS_ENDPOINTS
   FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"
-  load_node_settings
-  old_vless="$VLESS_PORT" old_hy2="$HY2_PORT" old_anytls="$ANYTLS_PORT" old_tuic="$TUIC_PORT" old_vnet="$VLESS_NETWORK"
   begin_transaction update "$CONFIG" "$APP/tls" "$APP/client" "$APP/hopping.json" "$APP/firewall-owned.json" "$APP/manager.sh" "$MANAGER" "$HOP_UNIT_FILE" "$APP/runtime-state.json"
   snapshot_hopping
   if (( staged )); then
@@ -1352,10 +1337,9 @@ apply_changes() {
   check_configuration
   install_manager
   if [[ -f "$TEMP/hopping-plan.json" ]]; then apply_hopping_plan; fi
-  load_node_settings
-  open_firewall "$old_vless" "$old_hy2" "$old_anytls" "$old_tuic" "$old_vnet"
+  open_firewall
   restart_checked
-  update_firewall_ownership "$old_vless" "$old_hy2" "$old_anytls" "$old_tuic" "$old_vnet"
+  update_firewall_ownership
   export_client_files
   record_runtime_state
   if [[ ! -f "$APP/client/EXPORT-ERROR.txt" ]]; then show_node_details; fi
@@ -1509,21 +1493,41 @@ update_protocol_defaults() {
 
 export_client_files() {
   local rc report
+  CLIENT_EXPORT_FAILED=0
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
   report="$TEMP/client-export-error"
-  if node_config export 2>"$report"; then
-    rm -f "$APP/client/EXPORT-ERROR.txt"
+  if ! install -d -m 0700 "$APP/client"; then
+    CLIENT_EXPORT_FAILED=1
+    warn '无法创建可选的客户端导出目录；配置保存不受影响，请手动导出。'
+    return 0
+  fi
+  if CLIENT_EXPORT_OPTIONAL=1 node_config export "${1:-}" 2>"$report"; then
+    if ! rm -f "$APP/client/EXPORT-ERROR.txt"; then warn '旧的导出错误记录未能删除；请查看目录权限。'; fi
+    return 0
+  else rc=$?; fi
+  CLIENT_EXPORT_FAILED=1
+  cat "$report" >&2
+  if ! install -m 0600 "$report" "$APP/client/EXPORT-ERROR.txt"; then
+    warn '无法保存客户端导出错误记录；请保留上方诊断。'
+  fi
+  if [[ "$rc" == 3 ]]; then
+    if ! { node_config summary; cat "$report"; } > "$APP/client/node-info.txt"; then
+      warn '无法保存可选的节点说明；配置保存不受影响。'
+    fi
+    warn '服务端配置有效，该组合需手动配置客户端；可选资料未完整导出。'
   else
-    rc=$?
-    if [[ $rc != 3 ]]; then cat "$report" >&2; return "$rc"; fi
-    install -m 0600 "$report" "$APP/client/EXPORT-ERROR.txt"
-    install -m 0600 "$report" "$APP/client/node-info.txt"
-    warn '服务端配置有效，但该高级组合无法自动生成客户端资料；请查看 client/EXPORT-ERROR.txt 并手动配置客户端。'
+    warn "客户端资料导出失败（退出码 $rc）；配置保存不受影响，请检查上方原因并手动导出。"
   fi
 }
 
 node_config() {
-  export APP CONFIG DEFAULT_HY2_HOP_INTERVAL DEFAULT_TLS_HANDSHAKE_TIMEOUT LIVE_APP
+  case "${1:-}" in
+    show|json|yaml|export|export-yaml)
+      if [[ -z "${SERVER_IP:-}" && "${CLIENT_EXPORT_OPTIONAL:-0}" != 1 ]] && command -v curl >/dev/null; then
+        SERVER_IP="$(curl -4fsSL --connect-timeout 3 --max-time 8 https://api.ipify.org)" || SERVER_IP=''
+      fi ;;
+  esac
+  export APP CONFIG DEFAULT_HY2_HOP_INTERVAL DEFAULT_TLS_HANDSHAKE_TIMEOUT LIVE_APP SERVER_IP
   python3 - "$@" <<'PYCODE'
 import copy, hashlib, ipaddress, json, math, os, pathlib, re, ssl, sys, tempfile, uuid
 p = pathlib.Path(os.environ['CONFIG'])
@@ -1559,6 +1563,7 @@ def new_inbound_tag(kind):
     return result
 
 def listener_conflict(left,right):
+    if not left or not right: return False
     def networks(item):
         if (item.get('transport') or {}).get('type')=='quic': return {'udp'}
         if item.get('network'): return {item['network']}
@@ -1571,6 +1576,7 @@ def listener_conflict(left,right):
     return ('0.0.0.0' in (a,b)) and ':' not in a and ':' not in b
 
 def atomic(path, text):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     if path.is_symlink():
         sys.exit(f'拒绝覆盖符号链接：{path}')
     with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.node-', delete=False) as f:
@@ -1688,19 +1694,6 @@ if action in ('extract-inbound','replace-inbound'):
         hop=json.loads(hop_path.read_text())
         if hop['base_port']==old.get('listen_port'):
             hop['base_port']=candidate['listen_port'];write_json(hop_path,hop)
-    # A manually changed Reality private key requires a matching exported public key.
-    reality=(candidate.get('tls') or {}).get('reality') or {}
-    if candidate.get('type')=='vless' and reality.get('private_key')!=((old.get('tls') or {}).get('reality') or {}).get('private_key') and reality.get('enabled'):
-        import base64,subprocess
-        raw=base64.urlsafe_b64decode(reality['private_key']+'='*(-len(reality['private_key'])%4))
-        if len(raw)!=32: sys.exit('Reality 私钥必须解码为 32 字节。')
-        der=bytes.fromhex('302e020100300506032b656e04220420')+raw
-        result=subprocess.run(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],input=der,capture_output=True)
-        if result.returncode: sys.exit('无法由 Reality 私钥导出公钥。')
-        client_path=app/'client/vless-reality.outbound.json'
-        client=json.loads(client_path.read_text())
-        client['tls']['reality']['public_key']=base64.urlsafe_b64encode(result.stdout[-32:]).decode().rstrip('=')
-        write_json(client_path,client)
     print('changed');sys.exit()
 
 if action=='managed-sni-change':
@@ -1785,60 +1778,174 @@ if action == 'socks':
     sys.stdout.write('READY\0')
     sys.exit()
 
-v = inbound('vless-reality')
-h = inbound('hysteria2')
-a = inbound('anytls') if any(i.get('type')=='anytls' or (not i.get('type') and i.get('tag')=='anytls') for i in c['inbounds']) else None
-u = inbound('tuic') if any(i.get('type')=='tuic' or (not i.get('type') and i.get('tag')=='tuic') for i in c['inbounds']) else None
-for i in (v, h, *([a] if a else []), *([u] if u else [])):
-    if type(i.get('listen_port')) is not int or not 1 <= i['listen_port'] <= 65535:
-        sys.exit('配置中的协议端口无效。')
-    if not i.get('users') and action not in ('load','validate'):
-        sys.stderr.write('该入站没有可自动导出的用户，请手动配置客户端。\n'); sys.exit(3)
-if a and (a.get('type') != 'anytls' or listener_conflict(a,v)):
-    sys.exit('AnyTLS 类型或 TCP 端口无效，不能与 VLESS 端口相同。')
-if u and (u.get('type')!='tuic' or listener_conflict(u,h)):
-    sys.exit('TUIC UDP 端口不能与 Hysteria2 相同。')
-client_dir = app / 'client'
-vpath = client_dir / 'vless-reality.outbound.json'
-hpath = client_dir / 'hysteria2.outbound.json'
-apath = client_dir / 'anytls.outbound.json'
-upath = client_dir / 'tuic.outbound.json'
-vc = json.loads(vpath.read_text())
-hc = json.loads(hpath.read_text())
-hop_path = app/'hopping.json'
-hop = json.loads(hop_path.read_text()) if hop_path.exists() else {'enabled':False}
-if hop.get('enabled'):
-    expected_ports={i['listen_port'] for i in c['inbounds'] if i.get('type')=='hysteria2'} if action=='load' else {int(os.environ['HY2_PORT']) if action=='update' and len(sys.argv)>2 and sys.argv[2]=='ports' else h['listen_port']}
-    if hop.get('version') != 1 or hop.get('base_port') not in expected_ports or not isinstance(hop.get('ports'),list) or not hop['ports']:
-        sys.exit('跳跃配置与 HY2 监听端口不一致。')
+def export_clients():
+    from urllib.parse import quote, urlencode
+    import base64,subprocess
+    client_dir=app/'client';records=[];proxies=[];notes=[]
+    hop_path=app/'hopping.json'
+    hop=json.loads(hop_path.read_text()) if hop_path.exists() else {'enabled':False}
+    def unavailable(message):
+        sys.stderr.write(message+'\n');sys.exit(3)
+    def certificate(item):
+        tls=item.get('tls') or {}
+        if tls.get('client_authentication') or (tls.get('ech') or {}).get('enabled'):
+            unavailable('自定义 mTLS/ECH 需要手动补全客户端配置。')
+        if not tls.get('server_name'): unavailable('未指定证书对应的 SNI，请手动配置客户端。')
+        if tls.get('certificate_path'): return pathlib.Path(tls['certificate_path']).read_text()
+        if tls.get('certificate'):
+            value=tls['certificate'];return '\n'.join(value) if isinstance(value,list) else value
+        unavailable('动态证书尚不可用于自动固定校验，请手动配置客户端。')
+    def pin(cert):
+        leaf=re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',cert,re.S)
+        if not leaf: sys.exit('证书内容无效。')
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(leaf[0])).hexdigest()
+    labels={'vless':('vless-reality','VLESS-Reality'),'hysteria2':('hysteria2','Hysteria2'),'anytls':('anytls','AnyTLS'),'tuic':('tuic','TUIC')}
+    for kind,(filename,label) in labels.items():
+        items=[i for i in c.get('inbounds',[]) if i.get('type')==kind]
+        if not items: continue
+        if len(items)>1: unavailable(kind+' 存在多个入站，自动资料请分别手动配置客户端。')
+        item=items[0];tls=item.get('tls') or {};users=item.get('users') or []
+        if not users: unavailable('该入站没有可自动导出的用户，请手动配置客户端。')
+        user=users[0]
+        server=os.environ.get('SERVER_IP') or item.get('listen','')
+        if server in ('','::','0.0.0.0'): unavailable('配置仅提供通配监听地址；请用 SERVER_IP=公网地址 导出客户端资料。')
+        try: ipaddress.ip_address(server)
+        except ValueError:
+            if not re.fullmatch(r'[a-zA-Z0-9.-]+',server): unavailable('客户端服务器地址无效，请设置 SERVER_IP。')
+        authority='['+server+']' if ':' in server else server
+        client={'type':kind,'tag':filename,'server':server,'server_port':item['listen_port']}
+        client_tls={'enabled':True,'server_name':tls.get('server_name','')}
+        for key in ('handshake_timeout','alpn','min_version','max_version','cipher_suites','curve_preferences'):
+            if key in tls: client_tls[key]=copy.deepcopy(tls[key])
+        client_tls.setdefault('handshake_timeout',os.environ['DEFAULT_TLS_HANDSHAKE_TIMEOUT'])
+        client['tls']=client_tls
+        proxy={'name':label,'type':kind,'server':server,'port':item['listen_port']}
+        cert='';fingerprint='';extra=''
+        if kind=='vless':
+            reality=tls.get('reality') or {}
+            if not reality.get('enabled') or item.get('transport') or tls.get('client_authentication') or (tls.get('ech') or {}).get('enabled'):
+                unavailable('该 VLESS 高级 TLS/传输组合需手动配置客户端；服务端配置可正常应用。')
+            try:
+                raw=base64.urlsafe_b64decode(reality['private_key']+'='*(-len(reality['private_key'])%4))
+                if len(raw)!=32: raise ValueError('长度不是 32 字节')
+            except (ValueError,KeyError) as error: unavailable('Reality 私钥无效，无法推导公钥：'+str(error))
+            try: result=subprocess.run(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],input=bytes.fromhex('302e020100300506032b656e04220420')+raw,capture_output=True)
+            except OSError: unavailable('客户端资料需要 openssl 推导 Reality 公钥；服务端配置仍可正常应用。')
+            if result.returncode: unavailable('无法由配置中的 Reality 私钥推导公钥。')
+            public=base64.urlsafe_b64encode(result.stdout[-32:]).decode().rstrip('=')
+            ids=reality.get('short_id',[]);short_id=ids if isinstance(ids,str) else next(iter(ids),'')
+            client.update(uuid=user['uuid'],flow=user.get('flow') or '')
+            client_tls.update(server_name=tls.get('server_name') or (reality.get('handshake') or {}).get('server',''),utls={'enabled':True,'fingerprint':'chrome'},reality={'enabled':True,'public_key':public,'short_id':short_id})
+            proxy.update(uuid=client['uuid'],udp=True,network='tcp',tls=True,flow=client['flow'],**{'packet-encoding':'xudp','servername':client_tls['server_name'],'client-fingerprint':'chrome','reality-opts':{'public-key':public,'short-id':short_id}})
+            uri='vless://'+client['uuid']+'@'+authority+':'+str(item['listen_port'])+'?'+urlencode({'encryption':'none','flow':client['flow'],'security':'reality','sni':client_tls['server_name'],'fp':'chrome','pbk':public,'sid':short_id,'type':'tcp'})+'#VLESS-Reality'
+            detail=f"[VLESS Reality]\n地址：{server}   TCP 端口：{item['listen_port']}\nUUID: {client['uuid']}\nSNI: {client_tls['server_name']}\nReality Public Key: {public}\nShort ID: {short_id}\nVLESS URI: {uri}\n"
+        else:
+            cert=certificate(item);fingerprint=pin(cert)
+            client_tls.update(insecure=False,certificate=cert)
+            client['password']=user.get('password','')
+            proxy.update(password=client['password'],sni=client_tls['server_name'],**{'skip-cert-verify':False,'fingerprint':fingerprint})
+            port_text=str(item['listen_port'])
+            if kind=='hysteria2':
+                client_tls.setdefault('alpn',['h3']);proxy['alpn']=client_tls['alpn']
+                params={'sni':client_tls['server_name'],'insecure':'0','pinSHA256':fingerprint}
+                if item.get('obfs'):
+                    client['obfs']=copy.deepcopy(item['obfs'])
+                    proxy.update(obfs=item['obfs']['type'],**{'obfs-password':item['obfs']['password']})
+                    params.update(obfs=item['obfs']['type'],**{'obfs-password':item['obfs']['password']})
+                if hop.get('enabled') and hop.get('base_port')==item['listen_port']:
+                    client.pop('server_port');client.update(server_ports=hop['ports'],hop_interval=hop['hop_interval'])
+                    port_text=','.join(hop['ports']).replace(':','-')
+                    duration=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)',hop['hop_interval'])
+                    if not duration: unavailable('跳跃间隔需手动换算客户端配置。')
+                    seconds=float(duration[1])*{'ms':0.001,'s':1,'m':60,'h':3600}[duration[2]]
+                    proxy.update(ports=port_text,**{'hop-interval':math.ceil(seconds)})
+                    if math.ceil(seconds)!=seconds: notes.append(f'Mihomo 跳跃间隔仅支持整秒，已向上取整为 {math.ceil(seconds)} 秒；sing-box JSON 保留原间隔。')
+                uri='hysteria2://'+quote(client['password'],safe='')+'@'+authority+':'+port_text+'/?'+urlencode(params)+'#Hysteria2'
+                extra=f"客户端跳跃端口：{port_text}，间隔：{client.get('hop_interval','不启用')}\nBBR profile: {item.get('bbr_profile','standard')}\nObfuscation: {client.get('obfs',{}).get('type','none')}\nObfuscation password: {client.get('obfs',{}).get('password','not configured')}\nHysteria2 URI: {uri}\n"
+            elif kind=='anytls':
+                proxy.update(udp=True,**{'client-fingerprint':'chrome'})
+                uri='anytls://'+quote(client['password'],safe='')+'@'+authority+':'+port_text+'/?'+urlencode({'sni':client_tls['server_name'],'insecure':'0'})+'#AnyTLS'
+                extra='AnyTLS URI: '+uri+'\n'
+            else:
+                client.update(uuid=user['uuid'],congestion_control=item.get('congestion_control','cubic'),zero_rtt_handshake=item.get('zero_rtt_handshake',False),heartbeat=item.get('heartbeat','10s'),udp_relay_mode='native')
+                duration=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)',client['heartbeat'])
+                if not duration: unavailable('TUIC heartbeat 需手动换算为客户端配置。')
+                proxy.update(uuid=client['uuid'],udp=True,**{'congestion-controller':client['congestion_control'],'heartbeat-interval':int(float(duration[1])*{'ms':1,'s':1000,'m':60000,'h':3600000}[duration[2]]),'reduce-rtt':client['zero_rtt_handshake'],'udp-relay-mode':'native'})
+                if 'alpn' in client_tls: proxy['alpn']=client_tls['alpn']
+                uri='tuic://'+quote(client['uuid'],safe='')+':'+quote(client['password'],safe='')+'@'+authority+':'+port_text+'/?'+urlencode({'sni':client_tls['server_name'],'congestion_control':client['congestion_control'],'alpn':','.join(client_tls.get('alpn',[])),'allow_insecure':'0'})+'#TUIC'
+                extra=f"UUID: {client['uuid']}\nTUIC URI: {uri}\n"
+            detail=f"[{label}]\n地址：{server}   {'TCP 端口' if kind=='anytls' else 'UDP 监听端口' if kind=='hysteria2' else 'UDP 端口'}：{item['listen_port']}\nPassword: {client['password']}\nTLS SNI: {client_tls['server_name']}\n{extra}证书 SHA-256: {fingerprint}\nJSON 内嵌证书；YAML 使用证书指纹。分享链接需另行信任附带证书。\n"
+        records.append((filename,client,uri,cert,detail));proxies.append(proxy)
+        if len(users)>1: notes.append('多用户入站：自动资料仅包含各协议第一个用户，其余用户请分别配置客户端。')
+    if not records: unavailable('当前入站没有支持自动生成的客户端资料；服务端配置仍可管理和应用。')
+    def scalar(value):
+        return ''.join(f'\\u{ord(ch):04x}' if 0x7f<=ord(ch)<=0x9f or ord(ch) in (0x2028,0x2029) else ch for ch in json.dumps(value,ensure_ascii=False))
+    lines=['proxies:']
+    for proxy in proxies:
+        for index,(key,value) in enumerate(proxy.items()):
+            prefix='  - ' if index==0 else '    '
+            if isinstance(value,dict):
+                lines.append(prefix+key+':');lines.extend('      '+k+': '+scalar(v) for k,v in value.items())
+            else: lines.append(prefix+key+': '+scalar(value))
+    yaml='\n'.join(lines)+'\n'
+    final=c.get('route',{}).get('final','unspecified');final='Other SOCKS5' if final=='other-socks' else final
+    rejection='; private IPs rejected' if any(r.get('ip_is_private') and r.get('action')=='reject' for r in c.get('route',{}).get('rules',[])) else ''
+    summary='=== 节点连接资料（包含密码，请妥善保管） ===\n\n'+'\n'.join(r[4] for r in records)+'\nEverything else: '+final+rejection+'\n上游 SOCKS5 密码不在此显示。\n'+'\n'.join(notes)+'\n[Clash / Mihomo · proxies 配置]\n以下是当前配置；proxies.yaml 文件仅通过 export-yaml 手动导出或更新。\n'+yaml
+    if action=='yaml': print(yaml,end='');return
+    if action=='json': print(json.dumps({'outbounds':[r[1] for r in records]},indent=2,ensure_ascii=False));return
+    if action=='show':
+        colorful=sys.stdout.isatty() and os.environ.get('TERM','dumb')!='dumb' and 'NO_COLOR' not in os.environ;in_yaml=False
+        for line in summary.splitlines():
+            in_yaml=in_yaml or line=='proxies:';color=''
+            if colorful and not in_yaml:
+                if line.startswith('==='): color='\033[1;33m'
+                elif line.startswith('['): color='\033[1;36m'
+                elif line.startswith(('地址：','客户端跳跃端口：')): color='\033[1;32m'
+                elif line.startswith(('UUID:','Password:','Obfuscation password:','Short ID:')): color='\033[1;33m'
+            print(color+line+('\033[0m' if color else ''))
+        return
+    if action=='export-yaml': atomic(client_dir/'proxies.yaml',yaml);return
+    selected=sys.argv[2].removeprefix('regenerate-') if len(sys.argv)>2 and sys.argv[2].startswith('regenerate-') else ''
+    for filename,client,uri,cert,detail in records:
+        if selected and client['type']!=selected: continue
+        write_json(client_dir/(filename+'.outbound.json'),client)
+        if cert: atomic(client_dir/('hy2.crt' if client['type']=='hysteria2' else filename+'.crt'),cert)
+    atomic(client_dir/'node-info.txt',summary)
+    atomic(client_dir/'nodes.txt','\n'.join(r[2] for r in records)+'\n')
+    atomic(client_dir/'README.txt','资料由 config.json 及其引用证书按需生成；不参与读取或修改服务端配置。\nproxies.yaml 仅通过 export-yaml 可选导出；JSON 为客户端 outbound 对象。\n自签证书需要客户端信任，YAML 使用证书 SHA-256 固定校验。\n')
 
+if action in ('export','show','json','yaml','export-yaml'):
+    export_clients();sys.exit()
 
-if action == 'load':
-    values = {
-        'VLESS_PORT': v['listen_port'], 'HY2_PORT': h['listen_port'],
-        'VLESS_NETWORK': 'udp' if (v.get('transport') or {}).get('type')=='quic' else 'tcp',
-        'ANYTLS_PORT': a['listen_port'] if a else '',
-        'ANYTLS_SNI': (a.get('tls') or {}).get('server_name','') if a else '',
-        'ANYTLS_PASS': a.get('users',[{}])[0].get('password','') if a and a.get('users') else '',
-        'TUIC_PORT': u['listen_port'] if u else '',
-        'TUIC_SNI': (u.get('tls') or {}).get('server_name','') if u else '',
-        'TUIC_UUID': u.get('users',[{}])[0].get('uuid','') if u and u.get('users') else '',
-        'TUIC_PASS': u.get('users',[{}])[0].get('password','') if u and u.get('users') else '',
-        'UUID': v.get('users',[{}])[0].get('uuid','') if v.get('users') else '', 'REALITY_DOMAIN': (((v.get('tls') or {}).get('reality') or {}).get('handshake') or {}).get('server',(v.get('tls') or {}).get('server_name','')),
-        'HY2_SNI': h['tls'].get('server_name') or hc['tls']['server_name'],
-        'HY2_BBR_CURRENT': h.get('bbr_profile',''),
-        'HY2_PASS': h['users'][0].get('password','') if h.get('users') else '', 'HY2_OBFS_PASS': h.get('obfs', {}).get('password', ''),
-        'HY2_HOP_PORTS': ','.join(hop['ports']) if hop.get('enabled') else '',
-        'HY2_HOP_INTERVAL': hop.get('hop_interval',os.environ['DEFAULT_HY2_HOP_INTERVAL']),
-    }
-    for key, value in values.items():
-        sys.stdout.write(key + '\0' + str(value) + '\0')
-    sys.stdout.write('READY\0')
-    sys.exit()
+if action=='load':
+    def first(kind): return next((i for i in c.get('inbounds',[]) if i.get('type')==kind or (not i.get('type') and i.get('tag')==('vless-reality' if kind=='vless' else kind))),{})
+    v,h,a,u=(first(kind) for kind in ('vless','hysteria2','anytls','tuic'))
+    def user(item,key): return (item.get('users') or [{}])[0].get(key,'')
+    def tls(item): return item.get('tls') or {}
+    hop_path=app/'hopping.json';hop=json.loads(hop_path.read_text()) if hop_path.exists() else {}
+    values={'VLESS_PORT':v.get('listen_port',''),'HY2_PORT':h.get('listen_port',''),'VLESS_NETWORK':'udp' if (v.get('transport') or {}).get('type')=='quic' else 'tcp',
+            'ANYTLS_PORT':a.get('listen_port',''),'ANYTLS_SNI':tls(a).get('server_name',''),'ANYTLS_PASS':user(a,'password'),
+            'TUIC_PORT':u.get('listen_port',''),'TUIC_SNI':tls(u).get('server_name',''),'TUIC_UUID':user(u,'uuid'),'TUIC_PASS':user(u,'password'),
+            'UUID':user(v,'uuid'),'REALITY_DOMAIN':((tls(v).get('reality') or {}).get('handshake') or {}).get('server',tls(v).get('server_name','')),
+            'HY2_SNI':tls(h).get('server_name',''),'HY2_BBR_CURRENT':h.get('bbr_profile',''),'HY2_PASS':user(h,'password'),'HY2_OBFS_PASS':(h.get('obfs') or {}).get('password',''),
+            'HY2_HOP_PORTS':','.join(hop.get('ports',[])) if hop.get('enabled') else '','HY2_HOP_INTERVAL':hop.get('hop_interval',os.environ['DEFAULT_HY2_HOP_INTERVAL'])}
+    for key,value in values.items(): sys.stdout.write(key+'\0'+str(value)+'\0')
+    sys.stdout.write('READY\0');sys.exit()
 
+if action not in ('update','validate'): sys.exit('未知节点操作。')
+
+def optional_inbound(kind):
+    return inbound(kind) if any(i.get('type')==('vless' if kind=='vless-reality' else kind) or (not i.get('type') and i.get('tag')==kind) for i in c.get('inbounds',[])) else None
+v=optional_inbound('vless-reality');h=optional_inbound('hysteria2');a=optional_inbound('anytls');u=optional_inbound('tuic')
+for item in filter(None,(v,h,a,u)):
+    if type(item.get('listen_port')) is not int or not 1<=item['listen_port']<=65535: sys.exit('配置中的协议端口无效。')
 if action in ('update', 'validate'):
     mode = sys.argv[2]
     e = os.environ
+    if mode in ('ports','sni','credentials','rotate') and (not v or not h):
+        sys.exit('此批量快捷操作需要 VLESS 和 HY2；请通过协议子菜单逐项修改已有入站。')
+    if mode in ('regenerate-vless','regenerate-hysteria2','bbr') and not (v if mode=='regenerate-vless' else h):
+        sys.exit('配置中不存在要修改的协议。')
     if mode == 'add-anytls':
         if a: sys.exit('AnyTLS 已存在，请使用修改端口、SNI 或凭据功能。')
         a = {'type':'anytls','tag':new_inbound_tag('anytls'),'listen':'0.0.0.0','listen_port':int(e['ANYTLS_PORT']),
@@ -1870,7 +1977,7 @@ if action in ('update', 'validate'):
                     sys.exit(f'{key} 必须是有效域名或 IP 地址。')
         v['tls']['server_name'] = e['REALITY_DOMAIN']
         v['tls']['reality']['handshake']['server'] = e['REALITY_DOMAIN']
-        if e['HY2_SNI'] != (h['tls'].get('server_name') or hc['tls']['server_name']):
+        if e['HY2_SNI'] != h['tls'].get('server_name',''):
             for key, name in [('certificate_path','hy2.crt'),('key_path','hy2.key')]:
                 if pathlib.Path(h['tls'][key]).absolute() != (app/'tls'/name).absolute():
                     sys.exit('HY2 证书由外部路径管理，请先手动处理证书再修改 SNI。')
@@ -1897,12 +2004,10 @@ if action in ('update', 'validate'):
             u['users'][0].update(uuid=str(uuid.UUID(e['TUIC_UUID'])),password=e['TUIC_PASS'])
         if mode == 'rotate':
             v['tls']['reality'].update(private_key=e['REALITY_PRIVATE'], short_id=[e['SHORT_ID']])
-            vc['tls']['reality']['public_key'] = e['REALITY_PUBLIC']
     elif mode in ('regenerate-vless', 'regenerate-hysteria2', 'regenerate-anytls','regenerate-tuic'):
         if mode == 'regenerate-vless':
             v['users'][0]['uuid'] = str(uuid.UUID(e['UUID']))
             v['tls']['reality'].update(private_key=e['REALITY_PRIVATE'], short_id=[e['SHORT_ID']])
-            vc['tls']['reality']['public_key'] = e['REALITY_PUBLIC']
         elif mode=='regenerate-tuic':
             if not u: sys.exit('尚未安装 TUIC。')
             for key,suffix in [('certificate_path','.crt'),('key_path','.key')]:
@@ -1946,222 +2051,7 @@ if action in ('update', 'validate'):
         print('unchanged' if c == original else 'changed')
         sys.exit()
     write_json(p, c)
-    if mode in ('rotate','regenerate-vless'): write_json(vpath,vc)
 
-# Rebuild client artifacts from the installed server configuration, retaining its keys.
-if not ((v.get('tls') or {}).get('reality') or {}).get('enabled') or v.get('transport') or (v.get('tls') or {}).get('client_authentication') or ((v.get('tls') or {}).get('ech') or {}).get('enabled'):
-    sys.stderr.write('该 VLESS 高级 TLS/传输组合需手动配置客户端；服务端配置可正常应用。\n'); sys.exit(3)
-
-def read_certificate(item):
-    tls=(item.get('tls') or {})
-    if tls.get('client_authentication') or (tls.get('ech') or {}).get('enabled'):
-        sys.stderr.write('自定义 mTLS/ECH 需要手动补全客户端配置。\n');sys.exit(3)
-    if not tls.get('server_name'):
-        sys.stderr.write('未指定证书对应的 SNI，请手动配置客户端。\n'); sys.exit(3)
-    if tls.get('certificate_path'): return pathlib.Path(tls['certificate_path']).read_text()
-    if tls.get('certificate'):
-        cert=tls['certificate']
-        return '\n'.join(cert) if isinstance(cert,list) else cert
-    sys.stderr.write('动态证书尚不可用于自动固定校验，请手动配置客户端。\n'); sys.exit(3)
-
-def certificate_pin(cert):
-    leaf=re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',cert,re.S)
-    if not leaf: sys.exit('证书内容无效。')
-    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(leaf[0])).hexdigest()
-
-vc.update(server_port=v['listen_port'], uuid=v['users'][0]['uuid'], flow=(v['users'][0].get('flow') or ''))
-vc['tls']['server_name'] = v['tls'].get('server_name') or v['tls']['reality']['handshake']['server']
-short_ids=v['tls']['reality'].get('short_id',[])
-vc['tls']['reality']['short_id'] = short_ids if isinstance(short_ids,str) else next(iter(short_ids),'')
-hc.update(server_port=h['listen_port'], password=h['users'][0]['password'])
-if hop.get('enabled'):
-    hc.pop('server_port',None)
-    hc.update(server_ports=hop['ports'],hop_interval=hop['hop_interval'])
-else:
-    hc.pop('server_ports',None); hc.pop('hop_interval',None)
-if h.get('obfs'):
-    hc['obfs'] = copy.deepcopy(h['obfs'])
-else:
-    hc.pop('obfs', None)
-cert = read_certificate(h)
-hc['tls'].update(server_name=h['tls'].get('server_name') or hc['tls']['server_name'], certificate=cert, insecure=False)
-hc['tls']['alpn'] = h['tls'].get('alpn', ['h3'])
-for key in ('handshake_timeout','alpn','min_version','max_version','cipher_suites','curve_preferences'):
-    if key in v['tls']: vc['tls'][key]=copy.deepcopy(v['tls'][key])
-    if key in h['tls']: hc['tls'][key]=copy.deepcopy(h['tls'][key])
-vc['tls'].setdefault('handshake_timeout',os.environ['DEFAULT_TLS_HANDSHAKE_TIMEOUT'])
-hc['tls'].setdefault('handshake_timeout',os.environ['DEFAULT_TLS_HANDSHAKE_TIMEOUT'])
-ac = None
-if a:
-    anytls_cert = read_certificate(a)
-    anytls_fingerprint = certificate_pin(anytls_cert)
-    ac = {'type':'anytls','tag':'anytls','server':vc['server'],'server_port':a['listen_port'],
-          'password':a['users'][0]['password'],
-          'tls':{'enabled':True,'server_name':a['tls'].get('server_name',''),'insecure':False,'certificate':anytls_cert}}
-    for key in ('handshake_timeout','alpn','min_version','max_version','cipher_suites','curve_preferences'):
-        if key in a['tls']: ac['tls'][key]=copy.deepcopy(a['tls'][key])
-    ac['tls'].setdefault('handshake_timeout',os.environ['DEFAULT_TLS_HANDSHAKE_TIMEOUT'])
-uc = None
-if u:
-    tuic_cert=read_certificate(u);tuic_pin=certificate_pin(tuic_cert)
-    uc={'type':'tuic','tag':'tuic','server':vc['server'],'server_port':u['listen_port'],
-        'uuid':u['users'][0]['uuid'],'password':u['users'][0].get('password',''),
-        'congestion_control':u.get('congestion_control','cubic'),'zero_rtt_handshake':u.get('zero_rtt_handshake',False),
-        'heartbeat':u.get('heartbeat','10s'),'udp_relay_mode':'native',
-        'tls':{'enabled':True,'server_name':u['tls'].get('server_name',''),'certificate':tuic_cert,'insecure':False,
-               'handshake_timeout':u['tls'].get('handshake_timeout',os.environ['DEFAULT_TLS_HANDSHAKE_TIMEOUT'])}}
-    for key in ('alpn','min_version','max_version','cipher_suites','curve_preferences'):
-        if key in u['tls']: uc['tls'][key]=copy.deepcopy(u['tls'][key])
-from urllib.parse import quote, urlencode
-vless_uri = 'vless://' + vc['uuid'] + '@' + vc['server'] + ':' + str(vc['server_port']) + '?' + urlencode({
-    'encryption':'none', 'flow':vc['flow'], 'security':'reality', 'sni':vc['tls']['server_name'],
-    'fp':vc['tls'].get('utls', {}).get('fingerprint', 'chrome'), 'pbk':vc['tls']['reality']['public_key'],
-    'sid':vc['tls']['reality']['short_id'], 'type':'tcp'}) + '#VLESS-Reality'
-fingerprint = certificate_pin(cert)
-params = {'sni':hc['tls']['server_name'], 'insecure':'0', 'pinSHA256':fingerprint}
-if hc.get('obfs'):
-    params.update(obfs=hc['obfs']['type'], **{'obfs-password':hc['obfs']['password']})
-hy2_ports = ','.join(hop['ports']).replace(':','-') if hop.get('enabled') else str(h['listen_port'])
-hy2_uri = 'hysteria2://' + quote(hc['password'], safe='') + '@' + hc['server'] + ':' + hy2_ports + '/?' + urlencode(params) + '#Hysteria2'
-# JSON-quoted scalars are YAML-safe without adding a YAML runtime dependency.
-def yaml_scalar(value):
-    text = json.dumps(value, ensure_ascii=False)
-    return ''.join(f'\\u{ord(ch):04x}' if 0x7f <= ord(ch) <= 0x9f or ord(ch) in (0x2028,0x2029) else ch for ch in text)
-
-clash_vless = {
-    'name':'VLESS-Reality', 'type':'vless', 'server':vc['server'], 'port':vc['server_port'],
-    'uuid':vc['uuid'], 'udp':True, 'network':'tcp', 'tls':True,
-    'flow':vc['flow'], 'packet-encoding':'xudp', 'servername':vc['tls']['server_name'],
-    'client-fingerprint':vc['tls'].get('utls', {}).get('fingerprint','chrome'),
-    'reality-opts':{'public-key':vc['tls']['reality']['public_key'], 'short-id':vc['tls']['reality']['short_id']}
-}
-clash_hy2 = {
-    'name':'Hysteria2', 'type':'hysteria2', 'server':hc['server'], 'port':h['listen_port'],
-    'password':hc['password'], 'sni':hc['tls']['server_name'], 'alpn':hc['tls']['alpn'],
-    'skip-cert-verify':False, 'fingerprint':fingerprint
-}
-if hc.get('obfs'):
-    clash_hy2.update(obfs=hc['obfs']['type'], **{'obfs-password':hc['obfs']['password']})
-clash_hop_note = ''
-if hop.get('enabled'):
-    duration = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)',hop['hop_interval'])
-    seconds = float(duration[1])*{'ms':0.001,'s':1,'m':60,'h':3600}[duration[2]]
-    clash_seconds = math.ceil(seconds)
-    clash_hy2.update(ports=','.join(hop['ports']).replace(':','-'), **{'hop-interval':clash_seconds})
-    if clash_seconds != seconds:
-        clash_hop_note = f'Mihomo 跳跃间隔仅支持整秒，已向上取整为 {clash_seconds} 秒；sing-box JSON 保留原间隔。\n'
-clash_proxies = [clash_vless,clash_hy2]
-anytls_uri = ''
-anytls_summary = ''
-if ac:
-    clash_proxies.append({'name':'AnyTLS','type':'anytls','server':ac['server'],'port':ac['server_port'],
-                          'password':ac['password'],'udp':True,'sni':ac['tls']['server_name'],
-                          'client-fingerprint':'chrome','skip-cert-verify':False,'fingerprint':anytls_fingerprint})
-    anytls_uri = 'anytls://' + quote(ac['password'],safe='') + '@' + ac['server'] + ':' + str(ac['server_port']) + '/?' + urlencode({'sni':ac['tls']['server_name'],'insecure':'0'}) + '#AnyTLS'
-    anytls_summary = f'''
-[AnyTLS]
-地址：{ac['server']}   TCP 端口：{ac['server_port']}
-Password: {ac['password']}
-TLS SNI: {ac['tls']['server_name']}
-AnyTLS URI: {anytls_uri}
-证书 SHA-256: {anytls_fingerprint}
-JSON 已内嵌证书，YAML 使用证书指纹校验；分享链接需另行信任 anytls.crt。
-'''
-tuic_uri='';tuic_summary=''
-if uc:
-    interval=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)',uc['heartbeat'])
-    if not interval: sys.stderr.write('TUIC heartbeat 需手动换算为客户端配置。\n');sys.exit(3)
-    milliseconds=float(interval[1])*{'ms':1,'s':1000,'m':60000,'h':3600000}[interval[2]]
-    clash_tuic={'name':'TUIC','type':'tuic','server':uc['server'],'port':uc['server_port'],
-                'uuid':uc['uuid'],'password':uc['password'],'udp':True,'sni':uc['tls']['server_name'],
-                'congestion-controller':uc['congestion_control'],'heartbeat-interval':int(milliseconds),
-                'reduce-rtt':uc['zero_rtt_handshake'],'udp-relay-mode':'native',
-                'skip-cert-verify':False,'fingerprint':tuic_pin}
-    if 'alpn' in uc['tls']: clash_tuic['alpn']=uc['tls']['alpn']
-    clash_proxies.append(clash_tuic)
-    tuic_uri='tuic://'+quote(uc['uuid'],safe='')+':'+quote(uc['password'],safe='')+'@'+uc['server']+':'+str(uc['server_port'])+'/?'+urlencode({'sni':uc['tls']['server_name'],'congestion_control':uc['congestion_control'],'alpn':','.join(uc['tls'].get('alpn',[])),'allow_insecure':'0'})+'#TUIC'
-    tuic_summary=f'''\n[TUIC]\n地址：{uc['server']}   UDP 端口：{uc['server_port']}\nUUID: {uc['uuid']}\nPassword: {uc['password']}\nTLS SNI: {uc['tls']['server_name']}\n拥塞控制：{uc['congestion_control']}；0-RTT：{uc['zero_rtt_handshake']}；心跳：{uc['heartbeat']}\nTUIC URI: {tuic_uri}\n证书 SHA-256: {tuic_pin}\nJSON 内嵌证书；YAML 使用证书指纹。分享链接需另行信任 tuic.crt。\n'''
-yaml_lines = ['proxies:']
-for proxy in clash_proxies:
-    for index,(key,value) in enumerate(proxy.items()):
-        prefix = '  - ' if index == 0 else '    '
-        if isinstance(value,dict):
-            yaml_lines.append(prefix+key+':')
-            yaml_lines.extend('      '+k+': '+yaml_scalar(v) for k,v in value.items())
-        else:
-            yaml_lines.append(prefix+key+': '+yaml_scalar(value))
-clash_yaml = '\n'.join(yaml_lines)+'\n'
-
-other_route = 'Other SOCKS5' if c['route'].get('final') == 'other-socks' else c['route'].get('final', 'unspecified')
-summary = f'''=== 节点连接资料（包含密码，请妥善保管） ===
-
-[VLESS Reality]
-地址：{vc['server']}   TCP 端口：{vc['server_port']}
-UUID: {vc['uuid']}
-SNI: {vc['tls']['server_name']}
-Reality Public Key: {vc['tls']['reality']['public_key']}
-Short ID: {vc['tls']['reality']['short_id']}
-VLESS URI: {vless_uri}
-
-[Hysteria2]
-地址：{hc['server']}   UDP 监听端口：{h['listen_port']}
-客户端跳跃端口：{hy2_ports}，间隔：{hop.get('hop_interval','不启用')}
-云安全组需开放上述客户端 UDP 端口。
-Password: {hc['password']}
-TLS SNI: {hc['tls']['server_name']}
-BBR profile: {h.get('bbr_profile','standard')}
-Obfuscation: {hc.get('obfs', {}).get('type', 'none')}
-Obfuscation password: {hc.get('obfs', {}).get('password', 'not configured')}
-Hysteria2 URI: {hy2_uri}
-证书 SHA-256: {fingerprint}
-HY2 JSON 已内嵌证书，保持 tls.insecure=false。
-HY2 分享链接需客户端信任附带的 hy2.crt；仅有链接不能保证自签证书导入兼容。
-端口范围已包含在分享链接中；自定义跳跃间隔请导入 JSON 或下方 YAML。
-
-Google + YouTube => Google SOCKS5; other AI => AI SOCKS5; else {other_route}.
-Everything else: {other_route}; private IPs rejected
-上游 SOCKS5 密码不在此显示。
-'''
-summary += anytls_summary + tuic_summary
-if any(len(i.get('users',[]))>1 for i in (v,h,*([a] if a else []),*([u] if u else []))): summary += '\n多用户入站：自动资料仅包含各协议第一个用户，其余用户请分别配置客户端。\n'
-summary += '\n[Clash / Mihomo · proxies 配置]\n已有 proxies: 时只复制列表项，避免重复顶层键；HY2 / AnyTLS 使用证书 SHA-256 固定校验。\n以下是当前配置；proxies.yaml 文件仅通过 export-yaml 手动导出或更新。\n' + clash_hop_note + clash_yaml
-if action == 'export-yaml':
-    atomic(client_dir/'proxies.yaml', clash_yaml)
-    sys.exit()
-if action == 'yaml':
-    print(clash_yaml, end='')
-    sys.exit()
-if action == 'json':
-    print(json.dumps({'outbounds':[vc,hc]+([ac] if ac else [])+([uc] if uc else [])}, indent=2, ensure_ascii=False))
-    sys.exit()
-if action == 'show':
-    colorful = sys.stdout.isatty() and os.environ.get('TERM','dumb') != 'dumb' and 'NO_COLOR' not in os.environ
-    in_yaml = False
-    for line in summary.splitlines():
-        in_yaml = in_yaml or line == 'proxies:'
-        color = ''
-        if colorful and not in_yaml:
-            if line.startswith('==='): color = '\033[1;33m'
-            elif line.startswith('['): color = '\033[1;36m'
-            elif line.startswith(('地址：','客户端跳跃端口：')): color = '\033[1;32m'
-            elif line.startswith(('UUID:','Password:','Obfuscation password:','Short ID:')): color = '\033[1;33m'
-        print(color + line + ('\033[0m' if color else ''))
-    sys.exit()
-if action not in ('export', 'update'):
-    sys.exit('未知节点操作。')
-selected = sys.argv[2] if action=='update' and sys.argv[2].startswith('regenerate-') else ''
-if not selected or selected=='regenerate-vless': write_json(vpath, vc)
-if not selected or selected=='regenerate-hysteria2': write_json(hpath, hc)
-if ac and (not selected or selected=='regenerate-anytls'):
-    write_json(apath, ac)
-    atomic(client_dir/'anytls.crt', anytls_cert)
-if uc and (not selected or selected=='regenerate-tuic'):
-    write_json(upath,uc)
-    atomic(client_dir/'tuic.crt',tuic_cert)
-atomic(client_dir/'node-info.txt', summary)
-atomic(client_dir/'nodes.txt', vless_uri + '\n' + hy2_uri + '\n' + (anytls_uri+'\n' if ac else '')+(tuic_uri+'\n' if uc else ''))
-if not selected or selected=='regenerate-hysteria2': atomic(client_dir/'hy2.crt', cert)
-atomic(client_dir/'README.txt', 'YAML 文件通过 export-yaml 可选导出；修改节点后需重新执行该命令。\nproxies.yaml 是 Clash/Mihomo 的 proxies 段，已有同名顶层键时仅复制列表项；HY2 / AnyTLS 通过证书 SHA-256 固定校验。\nMihomo 跳跃间隔仅支持整秒，小数秒向上取整；sing-box JSON 保留精确间隔。\nAnyTLS JSON 内嵌自签证书，insecure=false；分享链接需另行导入 anytls.crt。\nJSON 文件是单个 outbound 对象，需要合入客户端配置。\nHY2 JSON 内嵌自签证书，insecure=false；分享链接需要另行导入 hy2.crt。\n分享链接包含跳跃端口范围，自定义间隔以 JSON 为准。\n端口、SNI 或凭据修改后，请重新导入节点资料。\n')
 PYCODE
 }
 
@@ -2356,15 +2246,9 @@ open(sys.argv[2],'w').write(json.dumps(c,indent=2)+'\n')
 PYCODE
     apply_hopping_plan
   fi
-  local update_status
-  if node_config update "$mode"; then
-    rm -f "$APP/client/EXPORT-ERROR.txt"
-  else
-    update_status=$?
-    [[ $update_status == 3 ]] || return "$update_status"
-    export_client_files
-  fi
+  node_config update "$mode"
   check_configuration
+  export_client_files "$mode"
   if [[ "$mode" == ports || "$mode" == add-anytls || "$mode" == add-tuic ]]; then open_firewall "$old_vless" "$old_hy2" "$old_anytls" "$old_tuic" "$old_vnet"; fi
   restart_checked
   if [[ "$mode" == ports || "$mode" == add-anytls || "$mode" == add-tuic ]]; then
@@ -2505,19 +2389,21 @@ if os.environ['FW_NFT'] == '1':
         else:
             sys.exit('无法识别本次新增的 nftables 端口规则。')
 retired = set()
-if len(sys.argv) in (3,4,5,6):
-    current = {(os.environ.get('VLESS_NETWORK') or 'tcp',int(os.environ['VLESS_PORT'])),('udp',int(os.environ['HY2_PORT']))}
-    if os.environ.get('ANYTLS_PORT'): current.add(('tcp',int(os.environ['ANYTLS_PORT'])))
-    if os.environ.get('TUIC_PORT'): current.add(('udp',int(os.environ['TUIC_PORT'])))
-    previous = {(sys.argv[5] if len(sys.argv)==6 else 'tcp',int(sys.argv[1])),('udp',int(sys.argv[2]))}
-    if len(sys.argv)>=4 and sys.argv[3]: previous.add(('tcp',int(sys.argv[3])))
-    if len(sys.argv)>=5 and sys.argv[4]: previous.add(('udp',int(sys.argv[4])))
+legacy=len(sys.argv) in (3,4,5,6)
+if legacy or os.environ.get('FW_PREVIOUS_ENDPOINTS'):
+    current=set();previous=set()
     if os.environ.get('FW_CONFIG_ENDPOINTS'):
         current={(parts[0],int(parts[1])) for line in os.environ['FW_CONFIG_ENDPOINTS'].splitlines() if len(parts:=line.split())>=2}
-        previous.update((parts[0],int(parts[1])) for line in os.environ.get('FW_PREVIOUS_ENDPOINTS','').splitlines() if len(parts:=line.split())>=2)
-    retired = previous-current
+    else:
+        for proto,key in ((os.environ.get('VLESS_NETWORK') or 'tcp','VLESS_PORT'),('udp','HY2_PORT'),('tcp','ANYTLS_PORT'),('udp','TUIC_PORT')):
+            if os.environ.get(key): current.add((proto,int(os.environ[key])))
+    if legacy:
+        for proto,value in ((sys.argv[5] if len(sys.argv)==6 else 'tcp',sys.argv[1]),('udp',sys.argv[2]),('tcp',sys.argv[3] if len(sys.argv)>=4 else ''),('udp',sys.argv[4] if len(sys.argv)>=5 else '')):
+            if value: previous.add((proto,int(value)))
+    previous.update((parts[0],int(parts[1])) for line in os.environ.get('FW_PREVIOUS_ENDPOINTS','').splitlines() if len(parts:=line.split())>=2)
+    retired=previous-current
     if not ledger.exists() and retired:
-        print('提示：旧部署没有防火墙归属记录，已有旧端口规则将保留，请自行确认。', file=sys.stderr)
+        print('提示：旧部署没有防火墙归属记录，已有旧端口规则将保留，请自行确认。',file=sys.stderr)
 known_markers = {r['marker'] for r in old + new}
 def leading_owned(record):
     backend = record['backend']
@@ -2620,6 +2506,7 @@ install_manager() {
     grep -qxF '# sing-box-deploy 管理入口' "$MANAGER" || die '该管理命令不属于本脚本，拒绝覆盖。'
   fi
   [[ -f "$SCRIPT_PATH" ]] || die '请先把脚本保存为文件，再运行安装。'
+  install -d -m 0700 "$APP"
   install -d -m 0755 "$(dirname "$MANAGER")"
   if [[ "$SCRIPT_PATH" != "$APP/manager.sh" ]]; then
     install -m 0700 "$SCRIPT_PATH" "$APP/manager.sh"
@@ -2631,7 +2518,7 @@ install_manager() {
 
 setup_manager() {
   need_root
-  [[ -d "$APP/client" ]] || die '请先安装节点。'
+  [[ -f "$CONFIG" ]] || die "配置文件不存在：$CONFIG"
   begin_transaction files "$APP/manager.sh" "$MANAGER"
   install_manager
   TRANSACTION=""
@@ -2640,11 +2527,11 @@ setup_manager() {
 service_cmd() {
   need_root
   case "$1" in
-    restart) require_no_pending; load_node_settings; restart_checked ;;
+    restart) require_no_pending; check_configuration; restart_checked ;;
     start)
       require_no_pending
       if ! systemctl is-active --quiet "$UNIT"; then
-        load_node_settings
+        check_configuration
         systemctl start "$UNIT"
         systemctl is-active --quiet "$UNIT"
         record_runtime_state
@@ -2656,24 +2543,86 @@ service_cmd() {
 
 check_connections() {
   need_root
-  [[ -f "$CONFIG" && -x "$BIN" ]] || die '请先安装。'
-  check_configuration
-  load_node_settings
-  local profile prefix
-  local -a values=()
-  for profile in ai google other; do
-    mapfile -d '' -t values < <(node_config socks "$profile")
-    [[ ${#values[@]} == 5 && "${values[4]}" == READY && -n "${values[0]}" ]] || die "未配置 $profile SOCKS5。"
-    prefix="${profile^^}_SOCKS"
-    export "${prefix}_HOST=${values[0]}" "${prefix}_PORT=${values[1]}" "${prefix}_USER=${values[2]}" "${prefix}_PASS=${values[3]}"
-    check_socks "$profile"
+  [[ -f "$CONFIG" && -x "$BIN" ]] || die '请指定有效配置文件及已安装的 sing-box 内核。'
+  "$BIN" check -c "$CONFIG"
+  local index
+  local -a probes=()
+  mapfile -d '' -t probes < <(python3 - "$CONFIG" <<'PYCODE'
+import ipaddress,json,pathlib,subprocess,sys
+config=json.loads(pathlib.Path(sys.argv[1]).read_text())
+probes=[]
+for outbound in config.get('outbounds',[]):
+    if outbound.get('type')!='socks': continue
+    if str(outbound.get('version','5'))!='5':
+        print('非 SOCKS5 出站跳过协议探测：'+json.dumps(outbound.get('tag','未命名'),ensure_ascii=False),file=sys.stderr)
+        continue
+    host,port=outbound.get('server'),outbound.get('server_port')
+    user,password=outbound.get('username',''),outbound.get('password','')
+    if not isinstance(host,str) or not host or type(port) is not int or not 1<=port<=65535:
+        sys.exit('SOCKS5 出站地址或端口无效。')
+    if any(not isinstance(value,str) or '\0' in value for value in (host,user,password)):
+        sys.exit('SOCKS5 出站包含无效字符串。')
+    label=json.dumps(outbound.get('tag','未命名'),ensure_ascii=False)
+    probes.append((label,host,str(port),user,password))
+if not probes: print('未配置 SOCKS5 出站，跳过 SOCKS5 连通性探测。',file=sys.stderr)
+reality_count=0
+for inbound in config.get('inbounds',[]):
+    label=json.dumps(inbound.get('tag',inbound.get('type','未命名')),ensure_ascii=False)
+    tls=inbound.get('tls') or {}
+    if not tls.get('enabled'): continue
+    reality=tls.get('reality') or {}
+    if reality.get('enabled'):
+        reality_count+=1
+        handshake=reality.get('handshake') or {}
+        host,port=handshake.get('server'),handshake.get('server_port')
+        if not isinstance(host,str) or not host or type(port) is not int or not 1<=port<=65535:
+            sys.exit('Reality 握手目标地址或端口无效。')
+        name=tls.get('server_name') or host
+        endpoint=f'[{host}]:{port}' if ':' in host else f'{host}:{port}'
+        args=['openssl','s_client','-connect',endpoint,'-tls1_3','-verify_return_error','-brief']
+        try: ipaddress.ip_address(name)
+        except ValueError: args+=['-servername',name,'-verify_hostname',name]
+        else: args+=['-verify_ip',name]
+        print('检查 Reality 握手目标 '+label+'：'+endpoint,file=sys.stderr)
+        try: result=subprocess.run(args,input='',text=True,capture_output=True,timeout=12)
+        except (OSError,subprocess.TimeoutExpired): sys.exit('Reality 握手目标检查无法完成或超时。')
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            sys.exit('Reality 目标 TLS 1.3/证书校验失败。')
+        continue
+    cert_path=tls.get('certificate_path')
+    cert=tls.get('certificate')
+    if cert_path:
+        args=['openssl','x509','-in',str(cert_path),'-noout','-dates','-checkend','0']
+        data=''
+    elif cert:
+        data='\n'.join(cert) if isinstance(cert,list) else cert
+        if not isinstance(data,str): sys.exit('TLS 内嵌证书格式无效。')
+        args=['openssl','x509','-noout','-dates','-checkend','0']
+    else:
+        print('TLS 入站 '+label+' 未提供静态证书，跳过离线到期检查；动态证书需在服务运行时核实。',file=sys.stderr)
+        continue
+    print('检查 TLS 静态证书到期时间：'+label,file=sys.stderr)
+    try: result=subprocess.run(args,input=data,text=True,capture_output=True,timeout=10)
+    except (OSError,subprocess.TimeoutExpired): sys.exit('TLS 证书检查无法完成或超时。')
+    if result.returncode:
+        sys.stderr.write(result.stderr)
+        sys.exit('TLS 证书无效、无法读取或已经到期。')
+    sys.stderr.write(result.stdout)
+if not reality_count: print('未配置 Reality 入站，跳过握手目标检查。',file=sys.stderr)
+for row in probes:
+    for value in row: sys.stdout.write(value+'\0')
+sys.stdout.write('READY\0')
+PYCODE
+)
+  (( ${#probes[@]} >= 1 && (${#probes[@]}-1)%5 == 0 )) && [[ "${probes[-1]}" == READY ]] || die '无法完成当前配置的连接检查。'
+  for ((index=0; index<${#probes[@]}-1; index+=5)); do
+    log "Checking SOCKS5 outbound ${probes[index]}"
+    export PROBE_SOCKS_HOST="${probes[index+1]}" PROBE_SOCKS_PORT="${probes[index+2]}" PROBE_SOCKS_USER="${probes[index+3]}" PROBE_SOCKS_PASS="${probes[index+4]}"
+    check_socks probe
+    unset PROBE_SOCKS_HOST PROBE_SOCKS_PORT PROBE_SOCKS_USER PROBE_SOCKS_PASS
   done
-  forget_socks
-  check_reality_target
-  openssl x509 -in "$APP/tls/hy2.crt" -noout -dates -checkend 0
-  if [[ -n "$ANYTLS_PORT" ]]; then openssl x509 -in "$APP/tls/anytls.crt" -noout -dates -checkend 0; fi
-  if [[ -n "$TUIC_PORT" ]]; then openssl x509 -in "$APP/tls/tuic.crt" -noout -dates -checkend 0; fi
-  log '配置、三组 SOCKS5、Reality 握手目标及证书有效期检查通过；公网节点连通性仍需客户端验证。'
+  log '当前配置、已配置 SOCKS5 及可检查的 TLS 项目检查通过；公网节点连通性仍需客户端验证。'
 }
 
 menu_action() {
@@ -3135,7 +3084,6 @@ kernel_update() {
   need_root
   check_os
   [[ -x "$BIN" && -f "$CONFIG" ]] || die '请先安装。'
-  load_node_settings
   check_configuration
   begin_transaction update /etc/sing-box "$APP/client" "$APP/tls" "$APP/rules"
   prepare_package_rollback
@@ -3175,6 +3123,13 @@ def allowed(name):
     path=pathlib.PurePosixPath(name)
     return bool(path.parts) and str(path)==name and not path.is_absolute() and '..' not in path.parts and (name in ('config.json','manifest.json','hopping.json') or path.parts[0] in allowed_roots)
 
+def tls_objects(value):
+    if isinstance(value,dict):
+        if isinstance(value.get('tls'),dict): yield value['tls']
+        for child in value.values(): yield from tls_objects(child)
+    elif isinstance(value,list):
+        for child in value: yield from tls_objects(child)
+
 if action=='create':
     directory=pathlib.Path(os.environ['BACKUP_DIR'])
     def inside(path, root):
@@ -3199,18 +3154,48 @@ if action=='create':
               'service':{'active':os.environ.get('BACKUP_SERVICE_ACTIVE')=='yes','enabled':os.environ.get('BACKUP_SERVICE_ENABLED')=='yes'},'files':{}}
     try:
         with stream, tarfile.open(fileobj=stream,mode='w:gz') as archive:
-            paths=[(config,'config.json')]
-            for root in sorted(allowed_roots):
+            original=config.read_bytes();c=json.loads(original);contents={};referenced=set()
+            def resource(obj,key,root,suffix):
+                if not obj.get(key): return
+                source=pathlib.Path(obj[key]).absolute()
+                if not source.is_file(): sys.exit('备份引用的资源不存在或不是普通文件：'+str(source))
+                data=source.read_bytes();referenced.add(str(source))
+                try:
+                    relative=source.relative_to(app/root)
+                    if '..' in relative.parts: raise ValueError()
+                    name=str(pathlib.PurePosixPath(root)/relative)
+                except ValueError:
+                    digest=hashlib.sha256(str(source.resolve()).encode()+b'\0'+data).hexdigest()
+                    name=f'{root}/imported-{digest}{suffix}'
+                if name in contents and contents[name]!=data: sys.exit('备份资源路径冲突：'+name)
+                contents[name]=data;obj[key]=str(app/name)
+            for tls in tls_objects(c):
+                for key,suffix in (('certificate_path','.crt'),('key_path','.key')): resource(tls,key,'tls',suffix)
+            for rule in c.get('route',{}).get('rule_set',[]):
+                for key in ('path','initial_path'):
+                    suffix='.json' if rule.get('format')=='source' or pathlib.Path(rule.get(key,'')).suffix=='.json' else '.srs'
+                    resource(rule,key,'rules',suffix)
+            # Managed directories remain optional; configured resources are always copied as plain bytes.
+            for root in sorted(allowed_roots-{'client'}):
                 base=app/root
                 if base.is_symlink(): sys.exit('不能备份符号链接目录：'+str(base))
-                if base.exists():
-                    paths.extend((p,str(p.relative_to(app))) for p in sorted(base.rglob('*')))
-            if (app/'hopping.json').exists(): paths.append((app/'hopping.json','hopping.json'))
-            for path,name in paths:
-                if path.is_symlink() or (not path.is_file() and not path.is_dir()): sys.exit('备份只接受普通文件和目录：'+str(path))
-                if path.is_dir(): continue
-                data=path.read_bytes(); manifest['files'][name]=hashlib.sha256(data).hexdigest()
-                info=tarfile.TarInfo(name); info.size=len(data); info.mode=0o600
+                if not base.exists(): continue
+                for path in sorted(base.rglob('*')):
+                    if path.is_symlink():
+                        if str(path.absolute()) in referenced: continue
+                        sys.exit('备份只接受普通文件和目录：'+str(path))
+                    if path.is_dir(): continue
+                    if not path.is_file(): sys.exit('备份只接受普通文件和目录：'+str(path))
+                    name=str(path.relative_to(app));data=path.read_bytes()
+                    if name in contents and contents[name]!=data: sys.exit('备份资源在读取期间已变化：'+str(path))
+                    contents[name]=data
+            if (app/'hopping.json').exists():
+                if (app/'hopping.json').is_symlink(): sys.exit('不能备份符号链接跳跃配置。')
+                contents['hopping.json']=(app/'hopping.json').read_bytes()
+            contents['config.json']=original if c==json.loads(original) else (json.dumps(c,indent=2,ensure_ascii=False)+'\n').encode()
+            for name,data in contents.items():
+                manifest['files'][name]=hashlib.sha256(data).hexdigest()
+                info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o600
                 archive.addfile(info,io.BytesIO(data))
             data=json.dumps(manifest,ensure_ascii=False,indent=2).encode()
             info=tarfile.TarInfo('manifest.json');info.size=len(data);info.mode=0o600
@@ -3225,7 +3210,7 @@ if action!='extract': sys.exit('未知备份操作。')
 source=pathlib.Path(sys.argv[2]); destination=pathlib.Path(sys.argv[3])
 destination.mkdir(mode=0o700)
 with tarfile.open(source,'r:gz') as archive:
-    members=archive.getmembers(); names=set()
+    members=archive.getmembers();names=set()
     for member in members:
         if not member.isfile() or not allowed(member.name) or member.name in names:
             sys.exit('备份包含重复、越界路径、链接或特殊文件，拒绝恢复。')
@@ -3239,43 +3224,34 @@ with tarfile.open(source,'r:gz') as archive:
         data=archive.extractfile(member).read()
         if hashlib.sha256(data).hexdigest()!=manifest['files'][member.name]: sys.exit('备份校验失败：'+member.name)
         target=destination/member.name;target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-        target.write_bytes(data); target.chmod(0o600)
-# Relocate only managed certificate/rules paths; never replay archived firewall ownership.
-c=json.loads((destination/'config.json').read_text()); old=pathlib.Path(manifest['app_path'])
-required_tls=[]
-for inbound in c['inbounds']:
-    tls=inbound.get('tls') or {}
-    for key in ('certificate_path','key_path'):
-        if key not in tls: continue
-        try: relative=pathlib.Path(tls[key]).relative_to(old/'tls')
-        except ValueError: sys.exit('备份引用了外部证书，拒绝自动恢复。')
-        if '..' in relative.parts: sys.exit('备份证书路径越界。')
-        tls[key]=str(app/'tls'/relative)
-        required_tls.append(str(pathlib.PurePosixPath('tls')/relative))
+        target.write_bytes(data);target.chmod(0o600)
+# Relocate the archived runtime resources; derived client documents are never prerequisites.
+c=json.loads((destination/'config.json').read_text());old=pathlib.Path(manifest['app_path']);required=[]
+def relocate(obj,key,root):
+    if not obj.get(key): return
+    try: relative=pathlib.Path(obj[key]).relative_to(old/root)
+    except ValueError: sys.exit('备份引用了未归档的外部资源：'+obj[key])
+    if '..' in relative.parts: sys.exit('备份资源路径越界。')
+    name=str(pathlib.PurePosixPath(root)/relative)
+    required.append(name);obj[key]=str(app/root/relative)
+for tls in tls_objects(c):
+    for key in ('certificate_path','key_path'): relocate(tls,key,'tls')
 for rule in c.get('route',{}).get('rule_set',[]):
-    if 'initial_path' in rule:
-        path=pathlib.Path(rule['initial_path'])
-        try: relative=path.relative_to(old/'rules')
-        except ValueError: sys.exit('备份引用了外部规则集路径。')
-        rule['initial_path']=str(app/'rules'/relative)
+    for key in ('path','initial_path'): relocate(rule,key,'rules')
 if old != app and c.get('experimental',{}).get('cache_file',{}).get('path') == str(old/'cache.db'):
     c['experimental']['cache_file']['path'] = str(app/'cache.db')
 (destination/'config.json').write_text(json.dumps(c,indent=2,ensure_ascii=False)+'\n')
 state=manifest.get('service',{'active':False,'enabled':False})
 if not isinstance(state,dict) or any(type(state.get(key)) is not bool for key in ('active','enabled')): sys.exit('备份中的服务状态无效。')
 (destination/'manifest.json').write_text(json.dumps(manifest)+'\n')
-required = ['client/vless-reality.outbound.json','client/hysteria2.outbound.json']+required_tls
-if 'client/EXPORT-ERROR.txt' not in names and any(i.get('type')=='anytls' or (not i.get('type') and i.get('tag')=='anytls') for i in c['inbounds']): required += ['client/anytls.outbound.json']
-if 'client/EXPORT-ERROR.txt' not in names and any(i.get('type')=='tuic' or (not i.get('type') and i.get('tag')=='tuic') for i in c['inbounds']): required += ['client/tuic.outbound.json']
 for name in required:
-    if name not in names: sys.exit('备份缺少必要文件：'+name)
+    if name not in names: sys.exit('备份缺少必要资源：'+name)
 PYCODE
 }
-
 backup_cmd() {
   need_root
   if [[ -d "$APP/pending" ]]; then warn '本次备份仅包含已应用配置，待应用修改未纳入备份。'; fi
-  [[ -f "$CONFIG" && -d "$APP/client" ]] || die '没有可备份的节点配置。'
+  [[ -f "$CONFIG" ]] || die '没有可备份的节点配置。'
   local target="${1:-${BACKUP_FILE:-}}" version
   if [[ -x "$BIN" ]] && version="$("$BIN" version 2>/dev/null)" && [[ -n "$version" ]]; then
     BACKUP_KERNEL_VERSION="${version%%$'\n'*}"
@@ -3297,7 +3273,7 @@ restore_backup() {
   require_no_pending
   [[ -x "$BIN" ]] || die '请先安装兼容的 sing-box 内核，再恢复配置。'
   local FW_PREVIOUS_ENDPOINTS=''
-  local source="${1:-${BACKUP_FILE:-}}" old_vless="" old_hy2="" old_anytls="" old_tuic="" old_vnet="tcp" answer
+  local source="${1:-${BACKUP_FILE:-}}" answer
   if [[ -z "$source" && -t 0 ]]; then
     printf '\n已有备份：\n'; ls -1 "$BACKUP_DIR/"*.tar.gz 2>/dev/null || true
     read -r -p '要恢复的备份完整路径：' source
@@ -3311,18 +3287,10 @@ restore_backup() {
     [[ "$answer" == YES ]] || return 0
   fi
   if [[ -f "$CONFIG" ]]; then
-    local ports
-    if ports="$(python3 - "$CONFIG" <<'PYCODE'
-import json,sys
-c=json.load(open(sys.argv[1]))
-print(next(i['listen_port'] for i in c['inbounds'] if i.get('type')=='vless' or (not i.get('type') and i.get('tag')=='vless-reality')),next(i['listen_port'] for i in c['inbounds'] if i.get('type')=='hysteria2' or (not i.get('type') and i.get('tag')=='hysteria2')),next((i['listen_port'] for i in c['inbounds'] if i.get('type')=='anytls' or (not i.get('type') and i.get('tag')=='anytls')),'-'),next((i['listen_port'] for i in c['inbounds'] if i.get('type')=='tuic'),'-'),'udp' if any(i.get('type')=='vless' and (i.get('transport') or {}).get('type')=='quic' for i in c['inbounds']) else 'tcp')
-PYCODE
-)"; then
-      read -r old_vless old_hy2 old_anytls old_tuic old_vnet <<< "$ports"
-      FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"
-      [[ "$old_anytls" != - ]] || old_anytls=""
-      [[ "$old_tuic" != - ]] || old_tuic=""
-    else log '当前配置已损坏，旧防火墙规则将保留。'; fi
+    if ! FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"; then
+      FW_PREVIOUS_ENDPOINTS=''
+      log '当前配置已损坏，旧防火墙规则将保留。'
+    fi
   fi
   local -a restore_paths=("$APP/rules" "$APP/tls" "$APP/client" "$APP/hopping.json" "$APP/firewall-owned.json" "$APP/manager.sh")
   if [[ ! -e "$APP" && ! -L "$APP" ]]; then restore_paths=("$APP"); fi
@@ -3347,29 +3315,24 @@ PYCODE
     rm -rf "$APP/$name"
     if [[ -d "$TEMP/restored/$name" ]]; then cp -a "$TEMP/restored/$name" "$APP/$name"; else install -d -m 0700 "$APP/$name"; fi
   done
-  if [[ -f "$TEMP/restored/hopping.json" ]]; then
-    cp "$TEMP/restored/hopping.json" "$TEMP/hopping-plan.json"
-  else
-    python3 - "$CONFIG" "$TEMP/hopping-plan.json" "$DEFAULT_HY2_HOP_INTERVAL" <<'PYCODE'
-import json,pathlib,sys
-config=json.loads(pathlib.Path(sys.argv[1]).read_text())
-port=next(i['listen_port'] for i in config['inbounds'] if i.get('type')=='hysteria2' or (not i.get('type') and i.get('tag')=='hysteria2'))
-pathlib.Path(sys.argv[2]).write_text(json.dumps({'version':1,'enabled':False,'backend':'nft','base_port':port,'ports':[],'hop_interval':sys.argv[3]},indent=2)+'\n')
-PYCODE
-  fi
-  # Old runtime has already been stopped; plan applies the restored redirect target.
+  # Old rules were already stopped using their original metadata above.
   rm -f "$APP/hopping.json"
   install_manager
-  apply_hopping_plan
-  if [[ ! -f "$TEMP/restored/hopping.json" ]]; then rm -f "$APP/hopping.json"; fi
+  if [[ -f "$TEMP/restored/hopping.json" ]]; then
+    cp "$TEMP/restored/hopping.json" "$TEMP/hopping-plan.json"
+    apply_hopping_plan
+  elif [[ -f "$HOP_UNIT_FILE" ]]; then
+    systemctl disable "$HOP_UNIT"
+    rm -f "$HOP_UNIT_FILE"
+    systemctl daemon-reload
+  fi
   export_client_files
-  load_node_settings
   check_configuration
   rm -f "$APP/cache.db"
-  open_firewall "$old_vless" "$old_hy2" "$old_anytls" "$old_tuic" "$old_vnet"
+  open_firewall
   if [[ "$restore_active" == yes ]]; then restart_checked; else systemctl stop "$UNIT"; fi
   if [[ "$restore_enabled" == yes ]]; then systemctl enable "$UNIT"; else systemctl disable "$UNIT"; fi
-  if [[ -n "$old_vless" ]]; then update_firewall_ownership "$old_vless" "$old_hy2" "$old_anytls" "$old_tuic" "$old_vnet"; else update_firewall_ownership; fi
+  update_firewall_ownership
   if [[ ! -f "$APP/client/EXPORT-ERROR.txt" ]]; then show_node_details; fi
   TRANSACTION=""
   success '配置备份已恢复，服务启停和开机启动状态按备份恢复；内核版本未改变。请重新导入节点资料。'
@@ -3379,7 +3342,7 @@ uninstall_cmd() {
   need_root
   require_no_pending
   check_os
-  [[ -d "$APP/client" && -f "$CONFIG" ]] || die '没有可确认的本脚本部署。'
+  [[ -f "$CONFIG" ]] || die '没有可卸载的配置。'
   if [[ -e "$MANAGER" ]]; then
     [[ ! -L "$MANAGER" ]] && grep -qxF '# sing-box-deploy 管理入口' "$MANAGER" || die '管理入口不属于本脚本，拒绝删除。'
   fi
