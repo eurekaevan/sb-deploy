@@ -57,8 +57,17 @@ DEFAULT_HY2_HOP_PORTS='' # Empty disables hopping; e.g. 20000:20100,30000.
 DEFAULT_HY2_HOP_INTERVAL='30s'
 DEFAULT_HY2_BBR_PROFILE='standard'
 DEFAULT_SERVER_IP='' # Empty: detect the public IPv4 automatically.
+DEFAULT_LOG_LEVEL='warn' # sing-box log level; warn avoids logging visited domains by default.
+DEFAULT_REALITY_DOMAIN='la.mirrors.clouvider.net'
+DEFAULT_REALITY_FALLBACK_DOMAINS=(
+  'www.microsoft.com'
+  'www.apple.com'
+  'www.cloudflare.com'
+  'www.amazon.com'
+)
 
 # Environment overrides and explicit requests; ordinary edits load current config values.
+LOG_LEVEL="${LOG_LEVEL-$DEFAULT_LOG_LEVEL}"
 CERT_VALID_DAYS="${CERT_VALID_DAYS-$DEFAULT_CERT_VALID_DAYS}"
 CERT_WARN_DAYS="${CERT_WARN_DAYS-$DEFAULT_CERT_WARN_DAYS}"
 REQUEST_SOCKS_TFO="${SOCKS_TFO-}"
@@ -78,6 +87,9 @@ HY2_PORT="${HY2_PORT-$DEFAULT_HY2_PORT}"
 ANYTLS_PORT="${ANYTLS_PORT-$DEFAULT_ANYTLS_PORT}"
 TUIC_PORT="${TUIC_PORT-$DEFAULT_TUIC_PORT}"
 SERVER_IP="${SERVER_IP-$DEFAULT_SERVER_IP}"
+# An explicit REALITY_DOMAIN pins that target; otherwise installation tries the default and fallbacks.
+REALITY_DOMAIN_REQUEST="${REALITY_DOMAIN-}"
+REALITY_DOMAIN="${REALITY_DOMAIN:-$DEFAULT_REALITY_DOMAIN}"
 
 # Installation paths and rule sources.
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -90,7 +102,6 @@ UNIT="sing-box.service"
 HOP_UNIT="sing-box-hopping.service"
 HOP_UNIT_FILE="/etc/systemd/system/sing-box-hopping.service"
 BACKUP_DIR="/var/backups/sing-box-deploy"
-REALITY_DOMAIN="${REALITY_DOMAIN:-la.mirrors.clouvider.net}"
 AI_URL="https://github.com/DustinWin/ruleset_geodata/releases/download/sing-box-ruleset/ai.srs"
 GOOGLE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs"
 YOUTUBE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/youtube.srs"
@@ -188,6 +199,10 @@ die() { printf '\n' >&2; ui error "[ERROR] $*" >&2; exit 1; }
 [[ "$CERT_VALID_DAYS" =~ ^[1-9][0-9]*$ ]] || die 'CERT_VALID_DAYS 必须是正整数。'
 [[ "$CERT_WARN_DAYS" =~ ^[0-9]+$ ]] || die 'CERT_WARN_DAYS 必须是非负整数。'
 [[ "$HY2_BBR_PROFILE" == standard || "$HY2_BBR_PROFILE" == conservative || "$HY2_BBR_PROFILE" == aggressive ]] || die 'HY2_BBR_PROFILE 必须是 standard、conservative 或 aggressive。'
+case "$LOG_LEVEL" in
+  trace|debug|info|warn|error|fatal|panic) ;;
+  *) die 'LOG_LEVEL 必须是 trace、debug、info、warn、error、fatal 或 panic。' ;;
+esac
 # Snapshot before the first mutation; keep backups if restoration itself fails.
 begin_transaction() {
   local mode="$1" path index=0
@@ -304,6 +319,7 @@ usage() {
   disable-hopping      暂存关闭 HY2 跳跃规则，保存后需 apply
   edit-protocol [标签] [JSON文件]  完整编辑现有入站所有字段；默认 nano，VISUAL / EDITOR 可覆盖
   set-protocol-defaults 更新已有协议的 TLS 10s、HY2 ignore_client_bandwidth 及 TUIC 默认参数
+  set-log-level [级别] 暂存 sing-box 日志级别；默认 warn，避免记录访问域名，应用后生效
   renew-certs          暂存续期托管自签证书；保留私钥/SNI/SAN，指纹改变，手动 apply 后重导客户端
   SERVER_IP=公网地址    可覆盖客户端导出地址；不写回服务端配置
   export-yaml          可选导出 Clash/Mihomo proxies.yaml；普通生成/导出只在结果中显示 YAML
@@ -337,6 +353,7 @@ config.json 是节点配置依据；client 目录仅为可删除、可重新生�
 普通 show/export 从已保存配置即时生成资料；通配监听地址无法直接确定公网地址，显式导出时可探测或用 SERVER_IP 指定。
 待应用修改及其导出结果位于 deployment/pending，应用前不要导入。
 安装支持三组 *_PROXY_* 通用参数；兼容 AI_SOCKS_*、GOOGLE_SOCKS_*、OTHER_SOCKS_*；支持 SERVER_IP。
+LOG_LEVEL 默认 warn，避免记录访问域名；REALITY_DOMAIN 可固定握手域名，留空自动尝试备选列表。
 请勿把密码放入命令参数或公开日志；填写凭据后的源码也应妥善保护。
 UFW/firewalld 放行规则持久化；裸 nftables/iptables 仅当前运行时生效。
 跳跃规则会通过独立 systemd 服务持久化，只转发发往本机的 UDP 流量。
@@ -533,26 +550,83 @@ forget_socks() {
   done
 }
 
+public_ipv4_candidate_is_global() {
+  local candidate="$1"
+  [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  SERVER_IP="$candidate" python_module network public_ipv4 >/dev/null 2>&1
+}
+
+# Try the local egress address first, then independent HTTPS echo services.
+detect_public_ipv4() {
+  local candidate source
+  local -a sources=(
+    'https://api.ipify.org'
+    'https://icanhazip.com'
+    'https://ifconfig.me/ip'
+    'https://checkip.amazonaws.com'
+  )
+  if command -v ip >/dev/null 2>&1; then
+    candidate="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<NF; i++) if ($i == "src") {print $(i+1); exit}}')" || candidate=''
+    if [[ -n "$candidate" ]] && public_ipv4_candidate_is_global "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  for source in "${sources[@]}"; do
+    candidate="$(curl -4fsSL --connect-timeout 5 --max-time 12 "$source" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$candidate" ]] && public_ipv4_candidate_is_global "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 public_ipv4() {
   SERVER_IP="${SERVER_IP:-}"
-  if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP="$(curl -4fsSL --connect-timeout 5 --max-time 12 https://api.ipify.org || true)"
+  if [[ -n "$SERVER_IP" ]]; then
+    export SERVER_IP
+    python_module network public_ipv4
+  else
+    SERVER_IP="$(detect_public_ipv4)" || SERVER_IP=''
+    [[ -n "$SERVER_IP" ]] || die 'Cannot detect a public IPv4 from the local route or the configured HTTP sources; set SERVER_IP=<your server public IP> and retry.'
+    export SERVER_IP
   fi
-  export SERVER_IP
-  python_module network public_ipv4
   log "Detected public IPv4: $SERVER_IP"
 }
 
+reality_target_supported() {
+  local domain="$1" output
+  output="$(timeout 12 openssl s_client -connect "${domain}:443" \
+    -servername "$domain" -tls1_3 -alpn h2 -verify_hostname "$domain" \
+    -verify_return_error </dev/null 2>&1)" || return 1
+  grep -qi 'Verify return code: 0 (ok)' <<< "$output" || return 1
+  grep -qi 'ALPN protocol: h2' <<< "$output"
+}
+
 check_reality_target() {
-  log "Testing third-party Reality handshake target ${REALITY_DOMAIN}:443"
-  local output
-  if output="$(timeout 12 openssl s_client -connect "${REALITY_DOMAIN}:443" \
-    -servername "$REALITY_DOMAIN" -tls1_3 -verify_hostname "$REALITY_DOMAIN" \
-    -verify_return_error </dev/null 2>&1)" && grep -qi 'Verify return code: 0 (ok)' <<< "$output"; then
-    log 'Reality target TLS certificate validated.'
+  local requested="${1:-${REALITY_DOMAIN_REQUEST:-}}" domain
+  local -a candidates=()
+  local seen=' '
+  if [[ -n "$requested" ]]; then
+    candidates=("$requested")
   else
-    die 'Reality target TLS 1.3/hostname verification failed; check DNS, reachability and certificate.'
+    candidates=("$DEFAULT_REALITY_DOMAIN" "${DEFAULT_REALITY_FALLBACK_DOMAINS[@]}")
   fi
+  for domain in "${candidates[@]}"; do
+    [[ -n "$domain" ]] || continue
+    [[ "$seen" != *" $domain "* ]] || continue
+    seen+="$domain "
+    log "Testing third-party Reality handshake target ${domain}:443 (TLS 1.3 + h2)"
+    if reality_target_supported "$domain"; then
+      REALITY_DOMAIN="$domain"
+      export REALITY_DOMAIN
+      log "Reality handshake target verified: ${domain}:443"
+      return 0
+    fi
+    warn "Reality handshake target ${domain}:443 failed TLS 1.3, h2 or certificate validation; trying the next candidate."
+  done
+  die "No usable Reality handshake target among: ${candidates[*]}. Set REALITY_DOMAIN to a domain that supports TLS 1.3 and h2."
 }
 
 download_rules() {
@@ -658,7 +732,7 @@ renew_certificates() {
 }
 
 write_jsons() {
-  export APP CONFIG REALITY_DOMAIN AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS HY2_BBR_PROFILE SOCKS_TFO TUIC_PORT TUIC_UUID TUIC_PASS TUIC_SNI DEFAULT_TLS_HANDSHAKE_TIMEOUT
+  export APP CONFIG REALITY_DOMAIN LOG_LEVEL AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS HY2_BBR_PROFILE SOCKS_TFO TUIC_PORT TUIC_UUID TUIC_PASS TUIC_SNI DEFAULT_TLS_HANDSHAKE_TIMEOUT
   python_module configuration generate
   check_configuration || die 'sing-box check failed. Service was not started.'
   node_config export
@@ -1429,6 +1503,21 @@ update_protocol_defaults() {
   success 'TLS 10s、HY2 带宽协商及默认参数已保存到待应用配置。'
 }
 
+update_log_level() {
+  local level="${1:-${LOG_LEVEL:-$DEFAULT_LOG_LEVEL}}" answer
+  if [[ -t 0 && $# == 0 ]]; then
+    read -r -p "sing-box 日志级别 trace/debug/info/warn/error/fatal/panic [${level}]：" answer
+    level="${answer:-$level}"
+  fi
+  case "$level" in
+    trace|debug|info|warn|error|fatal|panic) ;;
+    *) die 'LOG_LEVEL 必须是 trace、debug、info、warn、error、fatal 或 panic。' ;;
+  esac
+  node_config log-level "$level"
+  check_configuration
+  success "日志级别已保存为 ${level}；执行 apply 后生效。"
+}
+
 export_client_files() {
   local rc report
   CLIENT_EXPORT_FAILED=0
@@ -1462,8 +1551,10 @@ export_client_files() {
 node_config() {
   case "${1:-}" in
     show|json|yaml|export|export-yaml)
-      if [[ -z "${SERVER_IP:-}" && "${CLIENT_EXPORT_OPTIONAL:-0}" != 1 ]] && command -v curl >/dev/null; then
-        SERVER_IP="$(curl -4fsSL --connect-timeout 3 --max-time 8 https://api.ipify.org)" || SERVER_IP=''
+      if [[ -z "${SERVER_IP:-}" && "${CLIENT_EXPORT_OPTIONAL:-0}" != 1 ]]; then
+        if command -v ip >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
+          SERVER_IP="$(detect_public_ipv4)" || SERVER_IP=''
+        fi
       fi ;;
   esac
   export APP CONFIG DEFAULT_HY2_HOP_INTERVAL DEFAULT_TLS_HANDSHAKE_TIMEOUT LIVE_APP SERVER_IP
@@ -1643,7 +1734,7 @@ set_node() {
   check_configuration
   begin_transaction update "$CONFIG" "$APP/client" "$APP/tls" "$APP/firewall-owned.json" "$APP/hopping.json" "$HOP_UNIT_FILE"
   if [[ "$mode" == sni ]]; then
-    [[ "$REALITY_DOMAIN" == "$old_reality" ]] || check_reality_target
+    [[ "$REALITY_DOMAIN" == "$old_reality" ]] || check_reality_target "$REALITY_DOMAIN"
     [[ "$HY2_SNI" == "$old_sni" ]] || make_hy2_certificate
     if [[ -n "$ANYTLS_PORT" && "$ANYTLS_SNI" != "$old_anytls_sni" ]]; then make_tls_certificate anytls "$ANYTLS_SNI"; fi
     if [[ -n "$TUIC_PORT" && "$TUIC_SNI" != "$old_tuic_sni" ]]; then make_tls_certificate tuic "$TUIC_SNI"; fi
@@ -2430,7 +2521,8 @@ main_menu() {
     '高级操作' @group \
     '生成 / 重新生成协议' @protocol_creation_menu \
     '防火墙状态 / 详情 / 开关' @firewall_menu \
-    '续期托管自签证书（应用后重导客户端）' renew-certs
+    '续期托管自签证书（应用后重导客户端）' renew-certs \
+    '日志级别（默认 warn，保护访问隐私）' set-log-level
 }
 
 case "${1:-menu}" in
@@ -2466,6 +2558,7 @@ case "${1:-menu}" in
   edit-field) if (( $# >= 4 )); then stage_changes edit_inbound_field "$2" "$3" "$4"; else stage_changes edit_inbound_field "${2:-}" "${3:-}"; fi ;;
   disable-hopping) HY2_HOP_PORTS_REQUEST=0; stage_changes set_hopping "${2:-}" ;;
   set-protocol-defaults) stage_changes update_protocol_defaults ;;
+  set-log-level) if (( $# >= 2 )); then stage_changes update_log_level "$2"; else stage_changes update_log_level; fi ;;
   renew-certs) stage_changes renew_certificates ;;
   summary) show_dashboard ;;
   protocol-edit-header) protocol_edit_header ;;

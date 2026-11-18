@@ -106,6 +106,19 @@ def run():
     def write_json(path, obj):
         atomic(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
 
+    if action == "log-level":
+        levels = ("trace", "debug", "info", "warn", "error", "fatal", "panic")
+        level = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("LOG_LEVEL", "warn")
+        if level not in levels:
+            sys.exit("日志级别必须是 trace、debug、info、warn、error、fatal 或 panic。")
+        if (c.get("log") or {}).get("level") == level:
+            print("unchanged")
+            sys.exit()
+        c.setdefault("log", {})["level"] = level
+        write_json(p, c)
+        print(level)
+        sys.exit()
+
     if action in ("menu-inbounds", "menu-inbound", "menu-fields", "hopping-port", "inbound-label"):
 
         def emit(label, command):

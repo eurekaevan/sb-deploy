@@ -28,6 +28,8 @@
 - **端口跳跃**：为 Hysteria2 生成独立 systemd + UDP 重定向服务。
 - **备份与恢复**：带清单和 SHA-256 校验的私有备份包。
 - **客户端资料**：生成分享链接、sing-box outbound JSON、Clash / Mihomo proxies YAML 和证书指纹。
+- **日志隐私**：sing-box 日志级别默认 `warn`，避免记录访问域名；可用 `LOG_LEVEL` 或 `set-log-level` 调整。
+- **握手目标回退**：Reality 默认握手域名不可用时，自动尝试备选域名，并校验 TLS 1.3、h2 和证书。
 - **安全默认值**：凭据随机生成，配置和客户端目录默认仅 root 可读；错误输入不会写入运行配置。
 
 ---
@@ -43,8 +45,8 @@
 - 需要联网访问：
   - sing-box 官方软件源与 GPG 密钥
   - GitHub 规则集下载地址
-  - Reality 握手目标（默认 `la.mirrors.clouvider.net:443`）
-  - `api.ipify.org`（未指定公网 IPv4 时用于自动探测）
+  - Reality 握手目标（默认 `la.mirrors.clouvider.net:443`，不可用时自动尝试备选域名）
+  - 公网 IP 探测源（`api.ipify.org`、`icanhazip.com`、`ifconfig.me`、`checkip.amazonaws.com`，未指定 `SERVER_IP` 时使用）
 - 安装时会自动安装依赖：`curl`、`ca-certificates`、`openssl`、`python3`、`iproute2` / `iproute`、`diffutils`（提供更新校验使用的 `cmp`）
 
 > 脚本不会自动安装或接管 UFW / firewalld；检测到已启用的管理工具时才会添加本脚本拥有的规则。
@@ -105,7 +107,7 @@ sudo env \
 - 部署目录和 `sb-manager` 不得已存在
 - 目标端口未被占用
 - 代理上游认证和 CONNECT 可用，HTTPS 同时校验 TLS 证书
-- Reality 握手目标 TLS 1.3 与证书校验通过
+- Reality 握手目标 TLS 1.3、h2 与证书校验通过；显式指定 `REALITY_DOMAIN` 时只检查该域名，否则按默认及备选列表依次尝试
 
 安装完成后会自动安装快捷命令：
 
@@ -272,6 +274,22 @@ sudo bash sing-box-deploy.sh regenerate vless
 # 轮换全部凭据（旧节点会失效）
 sudo bash sing-box-deploy.sh rotate-credentials
 ```
+
+显式修改 `NEW_REALITY_DOMAIN` 时，脚本只检查该域名的 TLS 1.3、h2 和证书；通过后保存到待应用配置，执行 `apply` 才生效。不指定时，安装会从默认域名和备选域名中自动选择第一个可用的握手目标。
+
+`REALITY_DOMAIN` 的默认候选按顺序为：`la.mirrors.clouvider.net`、`www.microsoft.com`、`www.apple.com`、`www.cloudflare.com`、`www.amazon.com`。全部不可用时会明确失败，此时可用 `REALITY_DOMAIN` 指定其他同时支持 TLS 1.3 和 h2 的域名。
+
+### 日志级别
+
+```bash
+# 暂存为 warn（默认，不记录访问域名），执行 apply 后生效
+sudo bash sing-box-deploy.sh set-log-level warn
+
+# 排查问题时临时使用 debug 或 info
+sudo bash sing-box-deploy.sh set-log-level debug
+```
+
+环境变量 `LOG_LEVEL` 控制新生成配置的日志级别，默认 `warn`。`info` / `debug` 可能记录目标域名，排障完成后建议恢复为 `warn`。
 
 ### 代理出口（SOCKS5 / HTTPS）
 
@@ -451,7 +469,8 @@ sudo UNINSTALL_CONFIRM=YES bash sing-box-deploy.sh uninstall
 | `HY2_PORT` | `443` | Hysteria2 UDP 端口 |
 | `ANYTLS_PORT` | `8443` | AnyTLS TCP 端口 |
 | `TUIC_PORT` | `10443` | TUIC UDP 端口 |
-| `REALITY_DOMAIN` | `la.mirrors.clouvider.net` | Reality 握手域名，同时作为默认 SNI |
+| `REALITY_DOMAIN` | 自动选择（优先 `la.mirrors.clouvider.net`） | 显式设置时固定该 Reality 握手域名并校验 TLS 1.3 + h2；留空则失败后自动尝试备选域名 |
+| `LOG_LEVEL` | `warn` | sing-box 日志级别：`trace` / `debug` / `info` / `warn` / `error` / `fatal` / `panic`；`warn` 不记录访问域名 |
 | `SOCKS_TFO` | `true` | 三组 SOCKS5 / HTTPS 出站的 TCP Fast Open |
 | `HY2_BBR_PROFILE` | `standard` | `standard` / `conservative` / `aggressive` |
 | `HY2_HOP_PORTS` | 空（关闭） | 跳跃端口，例如 `20000:20100,30000` |
@@ -562,11 +581,23 @@ sudo /usr/bin/sing-box check -C /etc/sing-box
 
 ### 无法确定公网 IPv4
 
+脚本会先读取 `ip route get 1.1.1.1` 的本机出口地址，再依次尝试 `api.ipify.org`、`icanhazip.com`、`ifconfig.me/ip`、`checkip.amazonaws.com`，并过滤私网、回环等非公网地址。全部失败时手动指定：
+
 ```bash
 sudo SERVER_IP=203.0.113.10 bash sing-box-deploy.sh export
 ```
 
 `SERVER_IP` 只影响客户端导出，不写回服务端配置。
+
+### Reality 握手域名不可用
+
+安装时会校验握手域名的 TLS 1.3、h2 和证书。默认域名失败后会自动尝试 README 中列出的备选域名；如果全部失败，选择一个网络可达、同时支持 TLS 1.3 和 h2 的第三方域名：
+
+```bash
+sudo REALITY_DOMAIN=www.example.com bash sing-box-deploy.sh install
+```
+
+显式指定的域名不会自动回退到其他候选，失败时安装会停止。已有部署修改域名使用 `set-sni`，并需执行 `apply`。
 
 ### 防火墙放行后仍不可达
 
@@ -615,6 +646,7 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 - 脚本以 root 运行，会修改系统软件包、systemd 服务、配置和防火墙规则。
 - 配置、私钥和备份均包含敏感信息，请限制为 root 可读。
 - 不要把真实密码提交到 Git、命令历史、公开日志或截图中。
+- sing-box 日志默认使用 `warn`，避免记录访问域名；只有在排障时才临时提高日志级别。
 - 开启系统防火墙前，务必确认 SSH 已放行，避免把自己锁在服务器外。
 - 云安全组需要单独放行节点端口和全部跳跃端口。
 - 修改 SNI、凭据和协议前，先确认客户端可重新导入配置。

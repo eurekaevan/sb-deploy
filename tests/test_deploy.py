@@ -2116,7 +2116,7 @@ status_cmd
             subprocess.run(['openssl','ca','-selfsign','-batch','-config',str(work/'ca.cnf'),'-cert',str(cert),'-keyfile',str(key),'-in',str(work/'request'),'-startdate','20200101000000Z','-enddate','20200102000000Z','-notext','-out',str(work/'expired')],check=True,capture_output=True)
             cert.write_bytes((work/'expired').read_bytes())
 
-    def managed_node(self, anytls=False, tuic=False):
+    def managed_node(self, anytls=False, tuic=False, **env):
         self.config.parent.mkdir(parents=True)
         for name in ('tls', 'client', 'rules'):
             (self.app / name).mkdir(parents=True)
@@ -2137,7 +2137,7 @@ if [[ -n "$TUIC_PORT" ]]; then
   make_tls_certificate tuic "$TUIC_SNI"
 fi
 write_jsons
-''', ANYTLS_PORT='10443' if anytls else '', TUIC_PORT='11443' if tuic else '')
+''', ANYTLS_PORT='10443' if anytls else '', TUIC_PORT='11443' if tuic else '', **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         # The generated configuration references these downloaded bootstrap resources.
         for name in ('ai','google','youtube'):
@@ -3889,6 +3889,67 @@ firewall_system enable ufw
                     self.assertFalse(thread.is_alive())
                     self.assertEqual(result.returncode == 0, reply == 'success', result.stderr)
                     self.assertNotIn('secret', result.stderr)
+
+    def test_log_level_defaults_to_warn(self):
+        self.assertEqual(self.managed_node()['log']['level'], 'warn')
+
+    def test_log_level_override_and_set_log_level_stages(self):
+        self.assertEqual(self.managed_node(LOG_LEVEL='info')['log']['level'], 'info')
+        result = self.run_bash('stage_changes update_log_level debug')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['log']['level'], 'info')
+        pending = json.loads((self.app / 'pending/config.json').read_text())
+        self.assertEqual(pending['log']['level'], 'debug')
+        result = self.run_bash('apply_changes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.config.read_text())['log']['level'], 'debug')
+
+    def test_reality_target_falls_back_and_requires_h2(self):
+        tools = self.root / 'reality-probe'
+        tools.mkdir()
+        fake = tools / 'openssl'
+        fake.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+args = sys.argv[1:]
+target = args[args.index('-connect') + 1]
+with (pathlib.Path(os.environ['TEST_ROOT']) / 'reality-targets.txt').open('a') as f:
+    f.write(target + '\\n')
+if target == 'la.mirrors.clouvider.net:443':
+    print('Verify return code: 0 (ok)')
+elif target == 'www.microsoft.com:443':
+    print('ALPN protocol: h2')
+    print('Verify return code: 0 (ok)')
+else:
+    sys.exit(1)
+''')
+        fake.chmod(0o700)
+        body = f'export PATH={tools}:"$PATH"\ncheck_reality_target\nprintf "%s\\n" "$REALITY_DOMAIN"\n'
+        result = self.run_bash(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'www.microsoft.com')
+        calls = (self.root / 'reality-targets.txt').read_text().splitlines()
+        self.assertEqual(calls, ['la.mirrors.clouvider.net:443', 'www.microsoft.com:443'])
+        result = self.run_bash(body, REALITY_DOMAIN='blocked.example')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('No usable Reality handshake target', result.stderr)
+        calls = (self.root / 'reality-targets.txt').read_text().splitlines()
+        self.assertEqual(calls[-1], 'blocked.example:443')
+
+    def test_public_ipv4_uses_local_route_and_http_fallbacks(self):
+        result = self.run_bash('''SERVER_IP=''
+ip() { printf '1.1.1.1 via 192.0.2.1 dev eth0 src 192.168.50.2 uid 0\\n'; }
+curl() {
+  case "$*" in
+    *api.ipify.org*) return 22 ;;
+    *icanhazip.com*) printf '1.1.1.1\\n' ;;
+    *) return 1 ;;
+  esac
+}
+public_ipv4
+printf '%s\\n' "$SERVER_IP"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '1.1.1.1')
 
 
 if __name__ == '__main__':

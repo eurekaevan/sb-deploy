@@ -43,6 +43,9 @@ def generate():
 
     p = pathlib.Path(os.environ["APP"])
     e = os.environ
+    log_level = e.get("LOG_LEVEL") or "warn"
+    if log_level not in ("trace", "debug", "info", "warn", "error", "fatal", "panic"):
+        raise SystemExit("LOG_LEVEL 必须是 trace、debug、info、warn、error、fatal 或 panic。")
     resolver = {"server": "local", "strategy": "ipv4_only", "timeout": "3s"}
 
     def proxy(tag, prefix):
@@ -74,7 +77,7 @@ def generate():
         }
 
     config = {
-        "log": {"level": "info", "timestamp": True},
+        "log": {"level": log_level, "timestamp": True},
         "dns": {
             "servers": [{"type": "local", "tag": "local"}],
             "final": "local",
