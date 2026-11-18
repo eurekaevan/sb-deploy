@@ -22,16 +22,19 @@ DEFAULT_OTHER_SOCKS_USER=''
 DEFAULT_OTHER_SOCKS_PASS=''
 DEFAULT_FIREWALL_AUTO='true' # Manage only this script's owned port permits.
 DEFAULT_SOCKS_TFO='true' # Applies to all three SOCKS5 outbounds.
-REQUEST_SOCKS_TFO="${SOCKS_TFO-}"
-SOCKS_TFO="${SOCKS_TFO-$DEFAULT_SOCKS_TFO}"
 DEFAULT_VLESS_PORT='443'
 DEFAULT_HY2_PORT='443'
 DEFAULT_TUIC_PORT='10443'
 DEFAULT_TLS_HANDSHAKE_TIMEOUT='10s'
-DEFAULT_ANYTLS_PORT='8443' # AnyTLS uses TCP; must differ from VLESS_PORT.
+DEFAULT_ANYTLS_PORT='8443' # Separate TCP port for the default installation.
 DEFAULT_HY2_HOP_PORTS='' # Empty disables hopping; e.g. 20000:20100,30000.
 DEFAULT_HY2_HOP_INTERVAL='30s'
 DEFAULT_HY2_BBR_PROFILE='standard'
+DEFAULT_SERVER_IP='' # Empty: detect the public IPv4 automatically.
+
+# Environment overrides and explicit requests; ordinary edits load current config values.
+REQUEST_SOCKS_TFO="${SOCKS_TFO-}"
+SOCKS_TFO="${SOCKS_TFO-$DEFAULT_SOCKS_TFO}"
 HY2_BBR_PROFILE_REQUEST="${HY2_BBR_PROFILE-}"
 HY2_BBR_PROFILE="${HY2_BBR_PROFILE-$DEFAULT_HY2_BBR_PROFILE}"
 HY2_HOP_PORTS_REQUEST="${HY2_HOP_PORTS-}"
@@ -46,9 +49,9 @@ VLESS_PORT="${VLESS_PORT-$DEFAULT_VLESS_PORT}"
 HY2_PORT="${HY2_PORT-$DEFAULT_HY2_PORT}"
 ANYTLS_PORT="${ANYTLS_PORT-$DEFAULT_ANYTLS_PORT}"
 TUIC_PORT="${TUIC_PORT-$DEFAULT_TUIC_PORT}"
-DEFAULT_SERVER_IP='' # Empty: detect the public IPv4 automatically.
 SERVER_IP="${SERVER_IP-$DEFAULT_SERVER_IP}"
 
+# Installation paths and rule sources.
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 MANAGER="/usr/local/bin/sb-manager"
 APP="/var/lib/sing-box/deployment"
@@ -62,6 +65,7 @@ REALITY_DOMAIN="${REALITY_DOMAIN:-la.mirrors.clouvider.net}"
 AI_URL="https://github.com/DustinWin/ruleset_geodata/releases/download/sing-box-ruleset/ai.srs"
 GOOGLE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs"
 YOUTUBE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/youtube.srs"
+# Per-operation transaction state.
 TEMP=""
 TRANSACTION=""
 WAS_ACTIVE=0
@@ -242,6 +246,7 @@ trap 'ui error "[ERROR] Command failed at line $LINENO (exit $?)." >&2' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Command help and installation prerequisites.
 usage() {
   cat <<'EOF'
 用法：以 root 身份运行 bash sing-box-deploy.sh [命令]
@@ -360,6 +365,7 @@ EOF
   (( major > 1 || (major == 1 && minor >= 14) )) || die "sing-box >= 1.14 is required (installed: ${ver})"
 }
 
+# Protocol inputs, credentials, certificates and initial configuration.
 show_occupied_ports() {
   OCCUPIED_PORTS=''
   local count=0
@@ -518,11 +524,10 @@ check_reality_target() {
 
 download_rules() {
   mkdir -p "$APP/rules"
-  local entry name url
+  local name url
   local -a entries=("$@")
   if (( ${#entries[@]} == 0 )); then entries=(ai google youtube); fi
-  for entry in "${entries[@]}"; do
-    name="$entry"
+  for name in "${entries[@]}"; do
     case "$name" in
       ai) url="$AI_URL" ;; google) url="$GOOGLE_URL" ;; youtube) url="$YOUTUBE_URL" ;;
     esac
@@ -594,7 +599,7 @@ PYCODE
 write_jsons() {
   export APP CONFIG REALITY_DOMAIN AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS HY2_BBR_PROFILE SOCKS_TFO TUIC_PORT TUIC_UUID TUIC_PASS TUIC_SNI DEFAULT_TLS_HANDSHAKE_TIMEOUT
   python3 - <<'PYCODE'
-import json, os, pathlib, urllib.parse
+import json, os, pathlib
 p = pathlib.Path(os.environ['APP'])
 e = os.environ
 resolver = {'server':'local', 'strategy':'ipv4_only','timeout':'3s'}
@@ -721,6 +726,7 @@ start_official_unit() {
   record_runtime_state
 }
 
+# Firewall management and ownership.
 # Add rules through the active manager; only journal additions made by this run.
 open_firewall() {
   [[ ${STAGING:-0} != 1 ]] || return 0
@@ -1051,7 +1057,7 @@ PYCODE
 
 firewall_system() {
   need_root
-  local operation="${1:-}" backend="${2:-}" answer="${FIREWALL_CONFIRM:-}" choice output rc other
+  local operation="${1:-}" backend="${2:-}" answer="${FIREWALL_CONFIRM:-}" choice output rc
   local -a managers=()
   [[ "$operation" == enable || "$operation" == disable ]] || die '系统防火墙操作必须是 enable 或 disable。'
   if command -v ufw >/dev/null; then managers+=(ufw); fi
@@ -1122,6 +1128,7 @@ firewall_hints() {
   fi
 }
 
+# Installation, staged edits and manual application.
 fresh_install() {
   need_root
   check_os
@@ -1204,7 +1211,7 @@ fresh_install() {
   log 'Verify cloud firewall and actual client connectivity.'
 }
 
-# One transaction covers validation, atomic replacement and service restart.
+# SOCKS updates share one transaction; staged edits leave the running service untouched.
 set_socks_profile() {
   need_root
   [[ -f "$CONFIG" && -x "$BIN" ]] || die '需要现有 config.json 和可执行的 sing-box 内核。'
@@ -1256,12 +1263,12 @@ PYCODE
   forget_socks
   check_configuration
   if [[ ${STAGING:-0} != 1 ]]; then
-  systemctl restart "$UNIT"
-  sleep 2
-  if ! systemctl is-active --quiet "$UNIT"; then
-    journalctl -u "$UNIT" -n 40 --no-pager >&2 || true
-    die 'Service failed after configuration update.'
-  fi
+    systemctl restart "$UNIT"
+    sleep 2
+    if ! systemctl is-active --quiet "$UNIT"; then
+      journalctl -u "$UNIT" -n 40 --no-pager >&2 || true
+      die 'Service failed after configuration update.'
+    fi
   fi
   export_client_files
   if [[ ! -f "$APP/client/EXPORT-ERROR.txt" ]]; then show_node_details; fi
@@ -1275,8 +1282,7 @@ show_node_details() {
   node_config show
 }
 
-# Shared reader/writer for installed node settings and client exports.
-# Pending edits never touch the active configuration, certificates or network rules.
+# Validate the file being staged, or the complete directory used by the installed unit.
 check_configuration() {
   if [[ ${STAGING:-0} == 1 ]]; then "$BIN" check -c "$CONFIG"
   else "$BIN" check -C /etc/sing-box; fi
@@ -1460,16 +1466,14 @@ show_dashboard() {
       ui warning '  │  尚未安装节点。'
     fi
   fi
+  ui muted '  ╰─ 修改配置后需执行“应用配置并重启”才会生效。'
   if (( pending )); then
-    ui muted '  ╰─ 修改配置后需执行“应用配置并重启”才会生效。'
     printf '\n'
     ui warning '待应用配置（尚未生效）：'
     (CONFIG="$APP/pending/config.json"; APP="$APP/pending"; node_config summary) | while IFS= read -r line; do
       ui warning "  · $line"
     done
     ui warning '执行 apply 应用并重启；执行 discard-pending 丢弃修改。'
-  else
-    ui muted '  ╰─ 修改配置后需执行“应用配置并重启”才会生效。'
   fi
 }
 
@@ -1594,6 +1598,7 @@ export_client_files() {
   fi
 }
 
+# Shared config reader/writer and derived client exports; client files are never inputs.
 node_config() {
   case "${1:-}" in
     show|json|yaml|export|export-yaml)
@@ -1620,15 +1625,13 @@ c = json.loads(p.read_text())
 original = copy.deepcopy(c) if action == 'validate' else None
 
 def inbound(tag):
-    kind='vless' if tag=='vless-reality' else tag
-    values=[i for i in c['inbounds'] if i.get('type')==kind]
-    if not values: values=[i for i in c['inbounds'] if not i.get('type') and i.get('tag')==tag]
-    if len(values)>1 and action=='load': return values[0]
-    if len(values)!=1:
-        if action in ('export','show','json','yaml','export-yaml'):
-            sys.stderr.write(f'{kind} 存在多个入站或缺少预置入站，当前无法自动生成完整客户端资料，请手动配置客户端。\n');sys.exit(3)
+    kind = 'vless' if tag == 'vless-reality' else tag
+    values = [item for item in c['inbounds'] if item.get('type') == kind]
+    if not values:
+        values = [item for item in c['inbounds'] if not item.get('type') and item.get('tag') == tag]
+    if len(values) > 1:
         sys.exit(f'配置中应存在且仅存在一个入站：{kind}')
-    return values[0]
+    return values[0] if values else None
 
 def new_inbound_tag(kind):
     used={i.get('tag') for i in c.get('inbounds',[])}
@@ -2008,9 +2011,14 @@ if action=='load':
 
 if action not in ('update','validate'): sys.exit('未知节点操作。')
 
-def optional_inbound(kind):
-    return inbound(kind) if any(i.get('type')==('vless' if kind=='vless-reality' else kind) or (not i.get('type') and i.get('tag')==kind) for i in c.get('inbounds',[])) else None
-v=optional_inbound('vless-reality');h=optional_inbound('hysteria2');a=optional_inbound('anytls');u=optional_inbound('tuic')
+def validate_server_name(name, label):
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        if len(name) > 253 or not all(re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', part) for part in name.split('.')):
+            sys.exit(f'{label} 必须是有效域名或 IP 地址。')
+
+v, h, a, u = (inbound(kind) for kind in ('vless-reality', 'hysteria2', 'anytls', 'tuic'))
 for item in filter(None,(v,h,a,u)):
     if type(item.get('listen_port')) is not int or not 1<=item['listen_port']<=65535: sys.exit('配置中的协议端口无效。')
 if action in ('update', 'validate'):
@@ -2043,12 +2051,7 @@ if action in ('update', 'validate'):
         if a: a['listen_port'] = int(e['ANYTLS_PORT'])
     elif mode == 'sni':
         for key in ('REALITY_DOMAIN', 'HY2_SNI'):
-            name = e[key]
-            try:
-                ipaddress.ip_address(name)
-            except ValueError:
-                if len(name) > 253 or not all(re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label) for label in name.split('.')):
-                    sys.exit(f'{key} 必须是有效域名或 IP 地址。')
+            validate_server_name(e[key], key)
         v['tls']['server_name'] = e['REALITY_DOMAIN']
         v['tls']['reality']['handshake']['server'] = e['REALITY_DOMAIN']
         if e['HY2_SNI'] != h['tls'].get('server_name',''):
@@ -2116,11 +2119,7 @@ if action in ('update', 'validate'):
         if not 1 <= a['listen_port'] <= 65535 or listener_conflict(a,v):
             sys.exit('AnyTLS 端口必须在 1-65535 内且与 VLESS TCP 端口不同。')
         if not a['users'][0]['password']: sys.exit('AnyTLS 密码不能为空。')
-        name = a['tls']['server_name']
-        try: ipaddress.ip_address(name)
-        except ValueError:
-            if len(name)>253 or not all(re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?',label) for label in name.split('.')):
-                sys.exit('ANYTLS_SNI 必须是有效域名或 IP 地址。')
+        validate_server_name(a['tls']['server_name'], 'ANYTLS_SNI')
     if action == 'validate':
         print('unchanged' if c == original else 'changed')
         sys.exit()
@@ -2535,6 +2534,7 @@ PYCODE
 }
 
 
+# Service status, manager entry point and connectivity checks.
 status_cmd() {
   need_root
   local result=0 state='' reload='' rc running=0 endpoints proto port label output hopping_enabled hop_state
@@ -2788,6 +2788,7 @@ menu_action() {
   if (( refresh )); then exec bash "$SCRIPT_PATH" menu; fi
 }
 
+# Configuration-driven menus.
 # Labels and actions share one list; menu groups use @group and are never numbered.
 run_menu() {
   local title="$1" header="$2" choice action index text count provider='' width number padding
@@ -3173,6 +3174,7 @@ set_hopping() {
   if [[ ${STAGING:-0} != 1 ]]; then success '端口跳跃已更新；请重新导入客户端配置，并在云安全组开放上面列出的 UDP 跳跃端口。'; fi
 }
 
+# Kernel package lifecycle and portable configuration backups.
 package_is_installed() {
   local status rc
   if [[ $PKG == apt ]]; then
@@ -3287,7 +3289,7 @@ kernel_update() {
 backup_archive() {
   export APP CONFIG BACKUP_DIR MANAGER HOP_UNIT_FILE
   python3 - "$@" <<'PYCODE'
-import datetime, hashlib, io, json, os, pathlib, re, tarfile, tempfile, sys
+import datetime, hashlib, io, json, os, pathlib, tarfile, tempfile, sys
 app=pathlib.Path(os.environ['APP']); config=pathlib.Path(os.environ['CONFIG']); action=sys.argv[1]
 allowed_roots={'rules','tls','client'}
 
@@ -3556,6 +3558,7 @@ uninstall_cmd() {
   success "卸载完成。备份保留在 $LAST_BACKUP；共享软件源、签名密钥、依赖及无法确认归属的旧防火墙规则已保留。"
 }
 
+# Main menu and command dispatch.
 main_menu() {
   need_root
   [[ -t 0 ]] || { usage; return 0; }

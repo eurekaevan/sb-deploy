@@ -2224,7 +2224,6 @@ fresh_install
         dispatch=SOURCE[SOURCE.index('\ncase "${1:'):]
         dispatch=dispatch.replace('install) fresh_install ;;','install) begin_transaction update "$CONFIG"; echo changed > "$CONFIG"; false ;;')
         dispatch=dispatch.replace('status) if status_cmd; then exit 0; else exit "$?"; fi ;;','status) echo NEXT_ACTION_OK ;;')
-        dispatch=dispatch.replace('summary) need_root; node_config summary; "$BIN" version | sed -n \'1p\' ;;','summary) echo 节点摘要 ;;')
         entry.write_text(self.prelude+'\nSCRIPT_PATH="'+str(entry)+'"\n'+dispatch)
         result=self.run_terminal('bash "'+str(entry)+'"','bad\n2\n0\n1\n\n6\n\n0\n')
         self.assertEqual(result.returncode,0,result.stderr)
