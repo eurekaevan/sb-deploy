@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sing-box', required=True)
 parser.add_argument('--inside-netns', action='store_true', help=argparse.SUPPRESS)
@@ -40,6 +41,9 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 t = m.DeployTests()
 t.setUp()
+# Unit fixtures mask firewall commands and ss. Integration must use real tools
+# inside the namespace established above; retain only its file/service isolation.
+t.prelude += '\nexport PATH=' + shlex.quote(os.environ['PATH']) + '\nunset -f ss\n'
 processes = []
 clientns = None
 httpd = None

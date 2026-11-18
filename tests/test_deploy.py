@@ -3,13 +3,12 @@ import ast
 import json
 import os
 import pty
-from pathlib import Path
-import re
 import socket
 import subprocess
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'sing-box-deploy.sh'
 SOURCE = SCRIPT.read_text()
@@ -27,11 +26,30 @@ class DeployTests(unittest.TestCase):
         source = LIB.replace('/etc/sing-box', str(self.config.parent))
         source = source.replace('/var/lib/sing-box/deployment', str(self.app))
         source = source.replace('/etc/apt', str(self.root / 'etc/apt'))
+        source = source.replace('/etc/default/ufw', str(self.root/'etc/default/ufw'))
+        source = source.replace('/etc/ufw', str(self.root/'etc/ufw'))
         source = source.replace('/usr/local/bin/sb-manager', str(self.root / 'bin/sb-manager'))
         source = source.replace('/etc/systemd/system/sing-box-hopping.service',str(self.root/'units/sing-box-hopping.service'))
         source = source.replace('/var/backups/sing-box-deploy',str(self.root/'backups'))
         self.lib = self.root / 'lib.sh'
         self.lib.write_text(source)
+        # Modules use the same isolated paths as the Bash orchestration fixture.
+        for module in (SCRIPT.parent/'lib').rglob('*.py'):
+            target = self.root/'lib'/module.relative_to(SCRIPT.parent/'lib')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            contents = module.read_text()
+            for old, new in (
+                ('/etc/sing-box', str(self.config.parent)),
+                ('/var/lib/sing-box/deployment', str(self.app)),
+                ('/etc/apt', str(self.root/'etc/apt')),
+                ('/etc/default/ufw', str(self.root/'etc/default/ufw')),
+                ('/etc/ufw', str(self.root/'etc/ufw')),
+                ('/usr/local/bin/sb-manager', str(self.root/'bin/sb-manager')),
+                ('/etc/systemd/system/sing-box-hopping.service', str(self.root/'units/sing-box-hopping.service')),
+                ('/var/backups/sing-box-deploy', str(self.root/'backups')),
+            ):
+                contents = contents.replace(old, new)
+            target.write_text(contents)
         self.bin = self.root / 'sing-box'
         self.bin.write_text('''#!/bin/bash
 if [[ $1 == check ]]; then
@@ -116,7 +134,7 @@ ss() {{
 
     def run_bash(self, body, **env):
         return subprocess.run(['bash', '-c', self.prelude + body], stdin=subprocess.DEVNULL, text=True,
-                              capture_output=True, env={**os.environ, 'TEST_ROOT': str(self.root), **env}, timeout=20)
+                              capture_output=True, env={**os.environ, 'SSH_CONNECTION':'', 'SSH_CLIENT':'', 'TEST_ROOT': str(self.root), **env}, timeout=20)
 
     def old_config(self):
         self.config.parent.mkdir(parents=True)
@@ -142,8 +160,8 @@ set_socks_profile ai google
 
     def test_syntax(self):
         subprocess.run(['bash', '-n', str(SCRIPT)], check=True)
-        for marker, block in re.findall(r"<<'(PY(?:CODE)?)'\n(.*?)\n\1", SOURCE, re.S):
-            ast.parse(block)
+        for module in (SCRIPT.parent/'lib').rglob('*.py'):
+            ast.parse(module.read_text(), filename=str(module))
 
     def test_update_success(self):
         self.old_config()
@@ -522,7 +540,8 @@ show_node_details
         self.assertEqual(scalars['port'], 9443)
         self.assertEqual(scalars['obfs'], 'salamander')
         self.assertFalse(scalars['skip-cert-verify'])
-        import hashlib, ssl
+        import hashlib
+        import ssl
         cert = (self.app/'tls/hy2.crt').read_text()
         self.assertEqual(scalars['fingerprint'], hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest())
         self.assertEqual((self.app/'client/proxies.yaml').stat().st_mode & 0o777, 0o600)
@@ -662,6 +681,97 @@ else: os.execv(os.environ['REAL_OPENSSL'],[os.environ['REAL_OPENSSL'],*args])
         self.assertIn('未配置 Reality',result.stderr)
         self.assertFalse(self.app.exists())
 
+    def certificate_status_fixture(self, days, name):
+        cert=self.root/(name+'.crt');key=self.root/(name+'.key')
+        subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256',
+                        '-nodes','-days',str(days),'-keyout',str(key),'-out',str(cert),'-subj','/CN='+name+'.example'],
+                       check=True,capture_output=True)
+        return cert,key
+
+    def test_certificate_status_reads_actual_path_and_inline_leaf_without_changes(self):
+        import datetime
+        import ssl
+        far,_=self.certificate_status_fixture(90,'far')
+        near,_=self.certificate_status_fixture(2,'near')
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[
+            {'type':'custom-tls','tag':'path-cert','tls':{'enabled':True,'certificate_path':str(far)}},
+            {'type':'another-tls','tag':'inline-leaf','tls':{'enabled':True,'certificate':[near.read_text(),far.read_text()]}}]}))
+        before={str(p.relative_to(self.root)):p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        result=self.run_bash('ui() { printf "%s|%s\\n" "$1" "$2"; }; certificate_status',CERT_WARN_DAYS='30')
+        self.assertEqual(result.returncode,0,result.stderr)
+        lines=result.stdout.splitlines()
+        self.assertTrue(any(line.startswith('success|') and 'path-cert' in line and '剩余 90 天' in line for line in lines))
+        self.assertTrue(any(line.startswith('warning|') and 'inline-leaf' in line and '剩余 2 天' in line for line in lines))
+        end=subprocess.check_output(['openssl','x509','-in',str(near),'-noout','-enddate'],text=True).strip().partition('=')[2]
+        expected=datetime.datetime.fromtimestamp(ssl.cert_time_to_seconds(end),datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        self.assertIn(expected,result.stdout)
+        self.assertEqual({str(p.relative_to(self.root)):p.read_bytes() for p in self.root.rglob('*') if p.is_file()},before)
+        self.assertFalse(self.app.exists())
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_bash('ui() { printf "%s|%s\\n" "$1" "$2"; }; certificate_status',CERT_WARN_DAYS='1')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn('warning|',result.stdout)
+
+    def test_certificate_status_skips_reality_disabled_and_marks_dynamic_unavailable(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[
+            {'type':'vless','tag':'reality','tls':{'enabled':True,'reality':{'enabled':True},'certificate_path':'/must/not/read-reality'}},
+            {'type':'custom','tag':'disabled','tls':{'enabled':False,'certificate_path':'/must/not/read-disabled'}},
+            {'type':'custom','tag':'dynamic','tls':{'enabled':True,'certificate_provider':'provider'}}]}))
+        result=self.run_bash('certificate_status',CERT_WARN_DAYS='30')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('dynamic',result.stdout)
+        self.assertIn('离线无法确认到期时间',result.stdout)
+        self.assertNotIn('/must/not/read',result.stdout+result.stderr)
+        self.assertNotIn('剩余',result.stdout)
+        self.config.write_text(json.dumps({'inbounds':[]}))
+        result=self.run_bash('certificate_status',CERT_WARN_DAYS='30')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('当前没有需检查到期时间',result.stdout)
+
+    def test_certificate_status_reports_unreadable_invalid_and_missing_openssl(self):
+        cert,_=self.certificate_status_fixture(90,'valid')
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[
+            {'type':'tls-test','tag':'missing','tls':{'enabled':True,'certificate_path':str(self.root/'missing.crt')}},
+            {'type':'tls-test','tag':'invalid','tls':{'enabled':True,'certificate':'-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----'}}]}))
+        result=self.run_bash('ui() { printf "%s|%s\\n" "$1" "$2"; }; certificate_status',CERT_WARN_DAYS='30')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(sum(line.startswith('error|') for line in result.stdout.splitlines()),2)
+        self.assertIn('missing',result.stdout);self.assertIn('invalid',result.stdout)
+        self.config.write_text(json.dumps({'inbounds':[{'type':'tls-test','tls':{'enabled':True,'certificate_path':str(cert)}}]}))
+        (self.root/'no-tools').mkdir()
+        result=self.run_bash('''python3() { PATH="$TEST_ROOT/no-tools" /usr/bin/python3 "$@"; }
+certificate_status
+''',CERT_WARN_DAYS='30')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('未安装 openssl',result.stdout)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_certificate_status_reports_missing_or_invalid_config_without_false_success(self):
+        result=self.run_bash('certificate_status',CERT_WARN_DAYS='30')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('无法读取证书到期状态',result.stdout)
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('invalid JSON')
+        result=self.run_bash('certificate_status',CERT_WARN_DAYS='30')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('无法读取证书到期状态',result.stdout)
+
+    def test_certificate_status_expired_certificate_is_error_and_keeps_checking(self):
+        expired,key=self.certificate_status_fixture(2,'expired')
+        healthy,_=self.certificate_status_fixture(90,'healthy')
+        self.make_expired_certificate(expired,key)
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'inbounds':[
+            {'type':'tls-test','tag':'expired','tls':{'enabled':True,'certificate_path':str(expired)}},
+            {'type':'tls-test','tag':'healthy','tls':{'enabled':True,'certificate_path':str(healthy)}}]}))
+        result=self.run_bash('ui() { printf "%s|%s\\n" "$1" "$2"; }; certificate_status',CERT_WARN_DAYS='30')
+        self.assertNotEqual(result.returncode,0)
+        self.assertTrue(any(line.startswith('error|') and '已过期' in line for line in result.stdout.splitlines()))
+        self.assertTrue(any(line.startswith('success|') and 'healthy' in line for line in result.stdout.splitlines()))
+
     def test_output_colors_require_terminal_and_leave_yaml_plain(self):
         self.managed_node()
         body = "ui title '标题'\nmenu_choices $' 1. 安装\\n13. 卸载\\n'\nnode_config show"
@@ -724,7 +834,9 @@ else: os.execv(os.environ['REAL_OPENSSL'],[os.environ['REAL_OPENSSL'],*args])
         self.assertEqual(path.stat().st_mode&0o777,0o600)
 
     def test_anytls_generation_has_independent_password_certificate_and_clients(self):
-        import base64, hashlib, ssl
+        import base64
+        import hashlib
+        import ssl
         config = self.managed_node(anytls=True)
         a = config['inbounds'][2];h = config['inbounds'][1]
         self.assertEqual(a['type'],'anytls')
@@ -1523,6 +1635,121 @@ run_menu 动态菜单 '' @entries""",'1\n1\n0\n')
             self.assertFalse(any(name.startswith('client/') for name in handle.getnames()))
             self.assertIn('config.json',handle.getnames())
 
+    def test_certificate_renewal_stages_only_certificates_and_refreshes_pins(self):
+        import hashlib
+        import ssl
+        original=self.managed_node(anytls=True,tuic=True)
+        before=self.file_snapshot()
+        result=self.run_bash('stage_changes renew_certificates')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('指纹已经改变',result.stderr);self.assertIn('必须重新导出并导入客户端',result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertFalse((self.root/'service.log').exists())
+        pending=self.app/'pending'
+        for stem,outbound in (('hy2','hysteria2'),('anytls','anytls'),('tuic','tuic')):
+            self.assertEqual((pending/f'tls/{stem}.key').read_bytes(),(self.app/f'tls/{stem}.key').read_bytes())
+            cert=(pending/f'tls/{stem}.crt').read_text()
+            self.assertNotEqual(cert,(self.app/f'tls/{stem}.crt').read_text())
+            client=json.loads((pending/f'client/{outbound}.outbound.json').read_text())
+            self.assertEqual(client['tls']['certificate'],cert);self.assertFalse(client['tls']['insecure'])
+        after=self.file_snapshot()
+        self.assertEqual({k:v for k,v in after.items() if not k.startswith('deployment/pending/')},before)
+        result=self.run_bash('apply_changes\nnode_config export-yaml')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        yaml=(self.app/'client/proxies.yaml').read_text()
+        for stem in ('hy2','anytls','tuic'):
+            digest=hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.app/f'tls/{stem}.crt').read_text())).hexdigest()
+            self.assertIn('fingerprint: "'+digest+'"',yaml)
+        self.assertIn('skip-cert-verify: false',yaml)
+
+    def test_renewal_preserves_all_san_extensions_and_existing_sni(self):
+        original=self.managed_node()
+        cert=self.app/'tls/hy2.crt';key=self.app/'tls/hy2.key'
+        subprocess.run(['openssl','req','-x509','-key',str(key),'-days','1','-subj','/CN=la.mirrors.clouvider.net','-addext','subjectAltName=DNS:la.mirrors.clouvider.net,DNS:other.example,IP:192.0.2.1','-out',str(cert)],check=True,capture_output=True)
+        old_san=subprocess.check_output(['openssl','x509','-in',str(cert),'-noout','-ext','subjectAltName'])
+        result=self.run_bash('stage_changes renew_certificates')
+        self.assertEqual(result.returncode,0,result.stderr)
+        renewed=self.app/'pending/tls/hy2.crt'
+        self.assertEqual(subprocess.check_output(['openssl','x509','-in',str(renewed),'-noout','-ext','subjectAltName']),old_san)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertEqual(pending['inbounds'][1]['tls']['server_name'],original['inbounds'][1]['tls']['server_name'])
+
+    def test_expired_managed_certificate_can_be_renewed_without_live_changes(self):
+        self.managed_node()
+        cert=self.app/'tls/hy2.crt';key=self.app/'tls/hy2.key'
+        self.make_expired_certificate(cert,key);expired=cert.read_bytes()
+        result=self.run_bash('stage_changes renew_certificates')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(cert.read_bytes(),expired)
+        verified=subprocess.run(['openssl','verify','-CAfile',str(self.app/'pending/tls/hy2.crt'),str(self.app/'pending/tls/hy2.crt')],capture_output=True)
+        self.assertEqual(verified.returncode,0,verified.stderr)
+        result=self.run_bash('show_dashboard')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('已过期',result.stdout);self.assertIn('待应用配置的证书',result.stdout)
+        self.assertIn('剩余 825 天',result.stdout)
+
+    def test_shared_managed_certificate_is_renewed_once(self):
+        original=self.managed_node(anytls=True,tuic=True)
+        for item in original['inbounds'][2:]:
+            item['tls'].update(certificate_path=str(self.app/'tls/hy2.crt'),key_path=str(self.app/'tls/hy2.key'))
+        self.config.write_text(json.dumps(original))
+        result=self.run_bash('stage_changes renew_certificates')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('已暂存 1 张',result.stderr)
+        self.assertEqual((self.app/'pending/tls/anytls.crt').read_bytes(),(self.app/'tls/anytls.crt').read_bytes())
+
+    def test_renewal_does_not_touch_external_or_inline_certificates(self):
+        original=self.managed_node(anytls=True)
+        external=self.root/'own.crt';external_key=self.root/'own.key'
+        external.write_bytes((self.app/'tls/hy2.crt').read_bytes());external_key.write_bytes((self.app/'tls/hy2.key').read_bytes())
+        original['inbounds'][1]['tls'].update(certificate_path=str(external),key_path=str(external_key))
+        tls=original['inbounds'][2]['tls'];tls['certificate']=(self.app/'tls/anytls.crt').read_text();tls['key']=(self.app/'tls/anytls.key').read_text()
+        tls.pop('certificate_path');tls.pop('key_path')
+        self.config.write_text(json.dumps(original));before=self.file_snapshot()
+        result=self.run_bash('stage_changes renew_certificates')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('没有可续期',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.app/'pending').exists())
+
+    def test_certificate_renewal_failure_restores_previous_pending_files(self):
+        import shutil
+        self.managed_node(anytls=True)
+        result=self.run_bash('stage_changes edit_inbound_field hysteria2 /listen_port 19444')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=self.file_snapshot()
+        fake=self.root/'renew-failure';fake.mkdir()
+        openssl=shutil.which('openssl')
+        tool=fake/'openssl'
+        tool.write_text('#!/usr/bin/env python3\nimport os,sys\nif "-signkey" in sys.argv and sys.argv[sys.argv.index("-in")+1].endswith("anytls.crt"): sys.exit(31)\nos.execv('+repr(openssl)+',["openssl",*sys.argv[1:]])\n')
+        tool.chmod(0o700)
+        result=self.run_bash('stage_changes renew_certificates',PATH=str(fake)+os.pathsep+os.environ['PATH'])
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('证书续期签名失败',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_certificate_expiry_in_status_and_summary_warns_without_restart(self):
+        self.managed_node()
+        self.make_expired_certificate(self.app/'tls/hy2.crt',self.app/'tls/hy2.key')
+        result=self.run_bash('show_dashboard')
+        self.assertEqual(result.returncode,0,result.stderr);self.assertIn('已过期',result.stdout)
+        result=self.run_bash('status_cmd')
+        self.assertNotEqual(result.returncode,0);self.assertIn('已过期',result.stdout)
+        calls=(self.root/'service.log').read_text()
+        self.assertNotIn('restart',calls);self.assertNotIn('daemon-reload',calls)
+
+    def test_certificate_renewal_respects_source_defaults_and_explicit_lifetime(self):
+        self.managed_node()
+        result=self.run_bash('stage_changes renew_certificates',CERT_VALID_DAYS='365')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('(CONFIG="$APP/pending/config.json"; certificate_status)')
+        self.assertEqual(result.returncode,0,result.stderr);self.assertIn('剩余 365 天',result.stdout)
+        for value in ('0','-1','invalid'):
+            result=self.run_bash('stage_changes renew_certificates',CERT_VALID_DAYS=value)
+            self.assertNotEqual(result.returncode,0);self.assertIn('CERT_VALID_DAYS',result.stderr)
+
     def test_hy2_bbr_edit_is_staged_without_rotating_credentials(self):
         config = self.managed_node(anytls=True)
         config['inbounds'][1].pop('bbr_profile')
@@ -1554,7 +1781,10 @@ run_menu 动态菜单 '' @entries""",'1\n1\n0\n')
         self.assertIn('0. 返回 / 退出',result.stdout)
 
     def test_tuic_generated_defaults_and_secure_exports(self):
-        import base64,uuid,hashlib,ssl
+        import base64
+        import hashlib
+        import ssl
+        import uuid
         config=self.managed_node(anytls=True,tuic=True)
         u=config['inbounds'][3]
         self.assertEqual(u['type'],'tuic');self.assertEqual(u['listen_port'],11443)
@@ -1876,6 +2106,16 @@ status_cmd
         self.assertIn(':23456', queries)
         self.assertNotIn(':8443', queries)
 
+    def make_expired_certificate(self, cert, key):
+        """Replace a test certificate with a genuinely expired self-signed leaf, using its key."""
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            work=Path(directory)
+            (work/'index').touch();(work/'serial').write_text('01\n')
+            (work/'ca.cnf').write_text(f'[ca]\ndefault_ca=local\n[local]\ndatabase={work}/index\nserial={work}/serial\nnew_certs_dir={work}\ndefault_md=sha256\npolicy=names\n[names]\ncommonName=supplied\n')
+            subprocess.run(['openssl','x509','-x509toreq','-in',str(cert),'-signkey',str(key),'-out',str(work/'request')],check=True,capture_output=True)
+            subprocess.run(['openssl','ca','-selfsign','-batch','-config',str(work/'ca.cnf'),'-cert',str(cert),'-keyfile',str(key),'-in',str(work/'request'),'-startdate','20200101000000Z','-enddate','20200102000000Z','-notext','-out',str(work/'expired')],check=True,capture_output=True)
+            cert.write_bytes((work/'expired').read_bytes())
+
     def managed_node(self, anytls=False, tuic=False):
         self.config.parent.mkdir(parents=True)
         for name in ('tls', 'client', 'rules'):
@@ -2075,7 +2315,7 @@ write_jsons
             self.assertEqual(self.file_snapshot(),before)
 
     def test_password_edit_and_export_uri_encoding(self):
-        from urllib.parse import urlsplit,parse_qs,unquote
+        from urllib.parse import parse_qs, unquote, urlsplit
         before=self.managed_node()
         secret='Aa@:/?&+ %密码'
         result=self.run_bash('set_node credentials',NEW_HY2_PASS=secret)
@@ -2122,10 +2362,119 @@ if [[ $1 == generate ]]; then printf 'PrivateKey: XasIfmJKikt54X-Lg4AO5m87sSkmGL
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(len(json.loads(result.stdout)['outbounds']),2)
 
+
+    def test_https_three_groups_stage_independently_and_switch_back(self):
+        original=self.managed_node()
+        for profile in ('ai','google','other'):
+            group=profile.upper()
+            result=self.run_bash('check_socks() { :; }; stage_changes set_socks_profile '+profile,
+                **{group+'_PROXY_PROTOCOL':'https',group+'_PROXY_HOST':profile+'.proxy.example',group+'_PROXY_PORT':'443',group+'_PROXY_USER':'user',group+'_PROXY_PASS':'secret',group+'_PROXY_SNI':'secure.'+profile+'.example'})
+            self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        # Staging relocates managed certificate paths; all inbound settings stay identical.
+        inbounds=json.loads(json.dumps(pending['inbounds']).replace(str(self.app/'pending/tls'),str(self.app/'tls')))
+        self.assertEqual(inbounds,original['inbounds'])
+        self.assertEqual(pending['route'],original['route'])
+        for outbound in pending['outbounds'][1:]:
+            self.assertEqual(outbound['type'],'http');self.assertNotIn('version',outbound)
+            self.assertFalse(outbound['tls']['insecure']);self.assertTrue(outbound['tcp_fast_open'])
+        self.assertFalse((self.root/'service.log').exists())
+        result=self.run_bash('check_socks() { :; }; stage_changes set_socks_profile ai',AI_PROXY_PROTOCOL='socks5')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=json.loads((self.app/'pending/config.json').read_text())
+        self.assertEqual([o['type'] for o in pending['outbounds'][1:]],['socks','http','http'])
+        self.assertNotIn('tls',pending['outbounds'][1])
+        self.assertEqual(pending['route'],original['route'])
+
+    def test_https_probe_failure_preserves_previous_pending_and_live_files(self):
+        self.managed_node()
+        result=self.run_bash('stage_changes edit_inbound_field hysteria2 /listen_port 19443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=self.file_snapshot()
+        result=self.run_bash('check_socks() { return 31; }; stage_changes set_socks_profile ai',AI_PROXY_PROTOCOL='https')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.root/'service.log').exists())
+
+    def test_https_existing_http_options_are_not_lost_before_probe(self):
+        current=self.managed_node()
+        outbound=current['outbounds'][1]
+        outbound.update(type='http',tls={'enabled':True},headers={'X-Private':'sensitive-header'})
+        outbound.pop('version',None)
+        self.config.write_text(json.dumps(current))
+        before=self.file_snapshot()
+        result=self.run_bash('stage_changes set_socks_profile ai')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('custom CONNECT path/headers',result.stderr)
+        self.assertNotIn('sensitive-header',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertFalse((self.app/'pending').exists())
+
+    def test_https_apply_and_tfo_use_saved_protocol_types(self):
+        original=self.managed_node()
+        result=self.run_bash('check_socks() { :; }; stage_changes set_socks_profile google',GOOGLE_PROXY_PROTOCOL='https')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('stage_changes set_node tfo',SOCKS_TFO='false')
+        self.assertEqual(result.returncode,0,result.stderr)
+        result=self.run_bash('apply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        current=json.loads(self.config.read_text())
+        self.assertEqual([o['type'] for o in current['outbounds'][1:]],['socks','http','socks'])
+        self.assertTrue(all(not o['tcp_fast_open'] for o in current['outbounds'][1:]))
+        self.assertEqual(current['route'],original['route'])
+        self.assertEqual(current['inbounds'],original['inbounds'])
+        self.assertFalse((self.app/'pending').exists())
+        self.assertIn('restart sing-box.service',(self.root/'service.log').read_text())
+
+    def test_https_apply_failure_restores_live_config_and_keeps_pending(self):
+        original=self.managed_node()
+        result=self.run_bash('check_socks() { :; }; stage_changes set_socks_profile other',OTHER_PROXY_PROTOCOL='https')
+        self.assertEqual(result.returncode,0,result.stderr)
+        pending=(self.app/'pending/config.json').read_bytes()
+        (self.root/'active').touch();(self.root/'fail-restart').touch()
+        result=self.run_bash('apply_changes')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(json.loads(self.config.read_text()),original)
+        self.assertEqual((self.app/'pending/config.json').read_bytes(),pending)
+        self.assertTrue((self.root/'active').exists())
+
+    def test_https_anonymous_config_wins_over_source_defaults(self):
+        current=self.managed_node()
+        outbound=current['outbounds'][1]
+        outbound.update(type='http',username='',password='',tls={'enabled':True,'insecure':False})
+        outbound.pop('version',None)
+        self.config.write_text(json.dumps(current))
+        source=self.lib.read_text().replace("DEFAULT_AI_SOCKS_USER=''","DEFAULT_AI_SOCKS_USER='source-user'").replace("DEFAULT_AI_SOCKS_PASS=''","DEFAULT_AI_SOCKS_PASS='source-secret'").replace("DEFAULT_AI_PROXY_SNI=''","DEFAULT_AI_PROXY_SNI='source.example'")
+        self.lib.write_text(source)
+        result=self.run_bash('''read_socks_profile ai
+[[ -z "$AI_SOCKS_USER" && -z "$AI_SOCKS_PASS" && "$AI_PROXY_PROTOCOL" == https && "$AI_PROXY_SNI" == old-ai ]]
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.config.read_text()),current)
+
+    def test_https_interactive_selection_can_clear_authentication(self):
+        self.managed_node()
+        result=self.run_terminal('''read_socks_profile ai
+[[ "$AI_PROXY_PROTOCOL" == https && -z "$AI_SOCKS_USER" && -z "$AI_SOCKS_PASS" && "$AI_PROXY_SNI" == proxy.example ]]
+echo HTTPS_INPUT_OK
+''','https\n\n\n:clear\n\nproxy.example\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('HTTPS_INPUT_OK',result.stdout)
+        self.assertNotIn('ai-secret',result.stdout)
+
+    def test_https_source_protocol_default_and_generic_environment_aliases(self):
+        source=self.lib.read_text().replace("DEFAULT_AI_PROXY_PROTOCOL='socks5'","DEFAULT_AI_PROXY_PROTOCOL='https'")
+        self.lib.write_text(source)
+        result=self.run_bash('''read_socks_profile ai
+[[ "$AI_PROXY_PROTOCOL" == https && "$AI_SOCKS_HOST" == proxy.example && "$AI_SOCKS_PORT" == 8443 && "$AI_SOCKS_USER" == new-user && "$AI_SOCKS_PASS" == new-secret && "$AI_PROXY_SNI" == secure.example ]]
+''',AI_PROXY_HOST='proxy.example',AI_PROXY_PORT='8443',AI_PROXY_USER='new-user',AI_PROXY_PASS='new-secret',AI_PROXY_SNI='secure.example')
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_installed_values_win_over_source_defaults_on_enter(self):
         self.managed_node()
         before=self.config.read_bytes()
-        result=self.run_terminal('read_socks_profile ai\npython3 - <<\'PYASSERT\'\nimport os\nassert os.environ["AI_SOCKS_HOST"]=="old-ai"\nassert os.environ["AI_SOCKS_PASS"]=="ai-secret"\nprint("CURRENT_VALUES_OK")\nPYASSERT\n','\n\n\n\n')
+        result=self.run_terminal('read_socks_profile ai\npython3 - <<\'PYASSERT\'\nimport os\nassert os.environ["AI_SOCKS_HOST"]=="old-ai"\nassert os.environ["AI_SOCKS_PASS"]=="ai-secret"\nprint("CURRENT_VALUES_OK")\nPYASSERT\n','\n\n\n\n\n')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('CURRENT_VALUES_OK',result.stdout)
         self.assertNotIn('ai-secret',result.stdout)
@@ -2335,6 +2684,23 @@ check_os() {{ PKG={kind}; }}
         self.assertEqual(json.loads(self.package_state.read_text())['installed'],old)
         self.assertEqual(self.file_snapshot(),before)
         self.assertFalse(any('--only-upgrade' in a for a in self.package_commands()))
+
+    def test_package_update_missing_cmp_aborts_before_any_changes(self):
+        self.managed_node()
+        old,_=self.setup_package_manager('apt')
+        before=self.file_snapshot()
+        result=self.run_bash('''command() {
+  if [[ "$1" == -v && "${2:-}" == cmp ]]; then return 1; fi
+  builtin command "$@"
+}
+kernel_update
+''')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('diffutils',result.stderr)
+        self.assertEqual(self.file_snapshot(),before)
+        self.assertEqual(json.loads(self.package_state.read_text())['installed'],old)
+        self.assertFalse((self.root/'package.log').exists())
+        self.assertFalse((self.root/'service.log').exists())
 
     def test_package_update_preserves_config_and_caches_old_package_first(self):
         self.managed_node()
@@ -2723,7 +3089,8 @@ cp "$TEMP/hopping-plan.json" "$TEST_ROOT/plan.json"
         self.assertEqual(list((self.root/'backups').glob('*.tar.gz')),[])
 
     def test_restore_rejects_traversal_links_and_corrupted_manifest_before_mutation(self):
-        import tarfile,io,hashlib
+        import io
+        import tarfile
         self.managed_node();before=self.file_snapshot()
         for kind in ('traversal','link','hash'):
             with self.subTest(kind=kind):
@@ -3094,47 +3461,277 @@ TRANSACTION=''
         self.assertIn('本脚本记录的放行规则：0 条',result.stdout)
         self.assertEqual(json.loads(self.firewall_state.read_text()),initial)
 
+    def setup_firewall_switch(self, **overrides):
+        fake=self.root/'firewall-switch';fake.mkdir()
+        state={'listeners':'LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=10,fd=3))',
+               'effective':'port 2222','ufw_active':False,'firewalld_active':False,'ipv6':'yes',
+               'ufw_chains':{'4':[],'6':[]},'runtime_zones':{'public':[]},'permanent_zones':{'public':[],'work':[]},**overrides}
+        self.switch_state=self.root/'firewall-switch.json';self.switch_state.write_text(json.dumps(state))
+        self.switch_log=self.root/'firewall-switch.log'
+        (self.root/'etc/default').mkdir(parents=True)
+        (self.root/'etc/default/ufw').write_text('IPV6='+state['ipv6']+'\n')
+        (self.root/'etc/ufw').mkdir(parents=True)
+        for family,name in (('4','user.rules'),('6','user6.rules')):
+            (self.root/'etc/ufw'/name).write_text('\n'.join(state['ufw_chains'][family])+'\n')
+        script=fake/'tool'
+        script.write_text("""#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['TEST_ROOT']);path=root/'firewall-switch.json';s=json.loads(path.read_text())
+tool=pathlib.Path(sys.argv[0]).name;a=sys.argv[1:]
+with (root/'firewall-switch.log').open('a') as f: f.write(json.dumps([tool,*a])+'\\n')
+def done(code=0,text=''):
+    if text: print(text)
+    sys.exit(code)
+def save():
+    path.write_text(json.dumps(s))
+    for family,name in (('4','user.rules'),('6','user6.rules')):
+        (root/'etc/ufw'/name).write_text('\\n'.join(s['ufw_chains'][family])+'\\n')
+if tool=='ss':
+    if a!=['-H','-ltnp']: done(99)
+    done(1 if s.get('fail_ss') else 0,s['listeners'])
+if tool=='sshd': done(1 if s.get('fail_sshd') else 0,s['effective'])
+if tool=='ufw':
+    if a==['status']: done(text='Status: active' if s['ufw_active'] else 'Status: inactive')
+    if a[:3]==['insert','1','allow']:
+        if s.get('fail_add'): done(7)
+        port=a[3].split('/')[0];rule='-A ufw-user-input -p tcp --dport '+port+' -j ACCEPT'
+        for family in ('4','6') if s['ipv6']=='yes' else ('4',):
+            if s.get('skip_insert') or (family=='6' and s.get('skip_ipv6')): continue
+            family_rule=rule.replace('ufw-user-input','ufw6-user-input') if family=='6' else rule
+            if family_rule not in s['ufw_chains'][family]: s['ufw_chains'][family].insert(0,family_rule)
+        save();done()
+    if a in (['--force','enable'],['--force','disable']):
+        if s.get('fail_enable') and a[-1]=='enable': done(9)
+        s['ufw_active']=a[-1]=='enable';save();done()
+if tool in ('firewall-cmd','firewall-offline-cmd'):
+    if a==['--state']: done(0 if s['firewalld_active'] else 252,'running' if s['firewalld_active'] else 'not running')
+    offline=tool=='firewall-offline-cmd'
+    if offline and s['firewalld_active']: done(99,'offline called while running')
+    mode='permanent_zones' if offline or '--permanent' in a else 'runtime_zones'
+    if a[-1]=='--get-zones': done(text=' '.join(s[mode]))
+    if a==['--check-config']: done(7 if s.get('fail_config') else 0)
+    zone=next((x.split('=',1)[1] for x in a if x.startswith('--zone=')),None)
+    if zone not in s[mode]: done(99,'unknown zone')
+    if a[-1].startswith('--add-port='):
+        if s.get('fail_add'): done(7)
+        port=a[-1].split('=',1)[1]
+        if port not in s[mode][zone]: s[mode][zone].append(port)
+        save();done()
+    if a[-1].startswith('--query-port='):
+        port=a[-1].split('=',1)[1]
+        done(1 if s.get('fail_query') or port not in s[mode][zone] else 0)
+if tool=='systemctl':
+    if a in (['enable','--now','firewalld.service'],['disable','--now','firewalld.service']):
+        if s.get('fail_enable') and a[0]=='enable': done(9)
+        s['firewalld_active']=a[0]=='enable'
+        if s['firewalld_active']: s['runtime_zones']=json.loads(json.dumps(s['permanent_zones']))
+        save();done()
+done(99,'Unexpected fixture operation: '+repr([tool,*a]))
+""")
+        script.chmod(0o700)
+        for name in ('ufw','firewall-cmd','firewall-offline-cmd','ss','sshd','systemctl'):
+            (fake/name).symlink_to(script)
+        self.prelude+=f'export PATH={fake}:"$PATH"\nss() {{ "{fake}/ss" "$@"; }}\nsystemctl() {{ "{fake}/systemctl" "$@"; }}\n'
+
     def test_system_firewall_requires_confirmation_and_verifies_ufw_toggle(self):
-        mocks='''ufw() {
-  if [[ "$1" == status ]]; then
-    if [[ -f "$TEST_ROOT/ufw-active" ]]; then echo 'Status: active'; else echo 'Status: inactive'; fi
-  elif [[ "$*" == '--force enable' ]]; then touch "$TEST_ROOT/ufw-active"
-  elif [[ "$*" == '--force disable' ]]; then rm -f "$TEST_ROOT/ufw-active"
-  else return 99; fi
-}
-firewall-cmd() { echo 'not running';return 252; }
-'''
-        result=self.run_bash(mocks+'firewall_system enable ufw')
+        self.setup_firewall_switch()
+        original=self.switch_state.read_bytes()
+        result=self.run_bash('firewall_system enable ufw')
         self.assertNotEqual(result.returncode,0)
-        self.assertFalse((self.root/'ufw-active').exists())
-        result=self.run_bash(mocks+'firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(self.switch_state.read_bytes(),original)
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertTrue((self.root/'ufw-active').exists())
-        result=self.run_bash(mocks+'firewall_system disable ufw',FIREWALL_CONFIRM='YES')
+        state=json.loads(self.switch_state.read_text());self.assertTrue(state['ufw_active'])
+        self.assertTrue(state['ufw_chains']['4'][0].endswith('--dport 2222 -j ACCEPT'))
+        commands=[json.loads(line) for line in self.switch_log.read_text().splitlines()]
+        self.assertLess(next(i for i,c in enumerate(commands) if c[:3]==['ufw','insert','1']),commands.index(['ufw','--force','enable']))
+        self.assertFalse((self.app/'firewall-owned.json').exists())
+        result=self.run_bash('firewall_system disable ufw',FIREWALL_CONFIRM='YES')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertFalse((self.root/'ufw-active').exists())
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
 
     def test_system_firewall_firewalld_toggle_is_persistent_and_verified(self):
-        mocks='''ufw() { echo 'Status: inactive'; }
-firewall-cmd() {
-  if [[ -f "$TEST_ROOT/firewalld-active" ]]; then echo running;else echo 'not running';return 252;fi
-}
-systemctl() {
-  echo "$*" >> "$TEST_ROOT/firewalld-service.log"
-  case "$*" in
-    'enable --now firewalld.service') touch "$TEST_ROOT/firewalld-active" ;;
-    'disable --now firewalld.service') rm -f "$TEST_ROOT/firewalld-active" ;;
-    *) return 99 ;;
-  esac
-}
-'''
-        result=self.run_bash(mocks+'firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.setup_firewall_switch()
+        result=self.run_bash('firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertTrue((self.root/'firewalld-active').exists())
-        result=self.run_bash(mocks+'firewall_system disable firewalld',FIREWALL_CONFIRM='YES')
+        state=json.loads(self.switch_state.read_text());self.assertTrue(state['firewalld_active'])
+        self.assertEqual(state['permanent_zones'],{'public':['2222/tcp'],'work':['2222/tcp']})
+        commands=[json.loads(line) for line in self.switch_log.read_text().splitlines()]
+        start=commands.index(['systemctl','enable','--now','firewalld.service'])
+        self.assertLess(commands.index(['firewall-offline-cmd','--zone=work','--query-port=2222/tcp']),start)
+        self.assertLess(commands.index(['firewall-offline-cmd','--check-config']),start)
+        result=self.run_bash('firewall_system disable firewalld',FIREWALL_CONFIRM='YES')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertFalse((self.root/'firewalld-active').exists())
-        self.assertEqual((self.root/'firewalld-service.log').read_text().splitlines(),['enable --now firewalld.service','disable --now firewalld.service'])
+        self.assertFalse(json.loads(self.switch_state.read_text())['firewalld_active'])
+
+    def test_no_ssh_listener_refuses_both_firewall_backends(self):
+        self.setup_firewall_switch(listeners='LISTEN 0 128 0.0.0.0:8443 0.0.0.0:* users:(("sing-box",pid=1,fd=2))',effective='port 22')
+        before=self.switch_state.read_bytes()
+        for backend in ('ufw','firewalld'):
+            result=self.run_bash('firewall_system enable '+backend,FIREWALL_CONFIRM='YES')
+            self.assertNotEqual(result.returncode,0);self.assertIn('未检测到',result.stderr)
+        self.assertEqual(self.switch_state.read_bytes(),before)
+
+    def test_ipv6_and_multiple_nondefault_ssh_ports_are_protected(self):
+        self.setup_firewall_switch(listeners='\n'.join([
+            'LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=1,fd=3))',
+            'tcp6 LISTEN 0 128 [::]:2022 [::]:* users:(("sshd",pid=1,fd=4))',
+            'LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=1,fd=5))']))
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES',SSH_CONNECTION='2001:db8::1 40123 2001:db8::2 2022')
+        self.assertEqual(result.returncode,0,result.stderr)
+        state=json.loads(self.switch_state.read_text())
+        for family in ('4','6'):
+            self.assertEqual({r.split('--dport ')[1].split()[0] for r in state['ufw_chains'][family]}, {'2022','2222'})
+        self.assertNotIn('--dport 22 ',self.switch_state.read_text())
+
+    def test_ipv6_disabled_or_unverified_ufw_cannot_be_enabled(self):
+        self.setup_firewall_switch(ipv6='no',listeners='LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=1,fd=3))')
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('IPV6=yes',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+        commands=[json.loads(line) for line in self.switch_log.read_text().splitlines()]
+        self.assertFalse(any(c[:2]==['ufw','insert'] for c in commands))
+
+    def test_current_ssh_session_port_must_be_covered(self):
+        self.setup_firewall_switch()
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES',SSH_CONNECTION='192.0.2.1 40000 192.0.2.2 2022')
+        self.assertNotEqual(result.returncode,0);self.assertIn('当前 SSH 会话端口',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+
+    def test_socket_activated_ssh_requires_bound_systemd_port(self):
+        self.setup_firewall_switch(listeners='LISTEN 0 128 [::]:2022 [::]:* users:(("systemd",pid=1,fd=3))',effective='port 2022')
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('--dport 2022',self.switch_state.read_text())
+
+    def test_ssh_detection_failure_prevents_firewall_mutations(self):
+        self.setup_firewall_switch(fail_ss=True)
+        before=self.switch_state.read_bytes()
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertEqual(self.switch_state.read_bytes(),before)
+
+    def test_failed_or_skipped_ufw_ssh_rule_prevents_enable(self):
+        self.setup_firewall_switch(skip_insert=True,ufw_chains={'4':['-A ufw-user-input -j DROP','-A ufw-user-input -p tcp --dport 2222 -j ACCEPT'],'6':[]})
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('优先放行',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+
+    def test_ufw_ipv6_rule_priority_is_verified_separately(self):
+        self.setup_firewall_switch(skip_ipv6=True,listeners='LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=1,fd=3))',ufw_chains={'4':[],'6':['-A ufw6-user-input -j DROP','-A ufw6-user-input -p tcp --dport 2222 -j ACCEPT']})
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+
+    def test_running_firewalld_protects_distinct_runtime_and_permanent_zones(self):
+        self.setup_firewall_switch(firewalld_active=True,runtime_zones={'runtime-only':[]},permanent_zones={'saved-only':[]})
+        result=self.run_bash('firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        commands=[json.loads(line) for line in self.switch_log.read_text().splitlines()]
+        self.assertIn(['firewall-cmd','--zone=runtime-only','--add-port=2222/tcp'],commands)
+        self.assertIn(['firewall-cmd','--permanent','--zone=saved-only','--add-port=2222/tcp'],commands)
+        self.assertFalse(any(c[0]=='firewall-offline-cmd' for c in commands))
+
+    def test_failed_firewalld_ssh_rule_verification_prevents_start(self):
+        self.setup_firewall_switch(fail_query=True)
+        result=self.run_bash('firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('核实 SSH',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['firewalld_active'])
+
+    def test_missing_offline_tool_refuses_firewalld_activation(self):
+        self.setup_firewall_switch()
+        result=self.run_bash("command() { if [[ $1 == -v && $2 == firewall-offline-cmd ]]; then return 1; else builtin command \"$@\"; fi; }; firewall_system enable firewalld",FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('缺少 firewall-offline-cmd',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['firewalld_active'])
+
+    def test_ssh_rule_write_failure_never_enables_either_firewall(self):
+        self.setup_firewall_switch(fail_add=True)
+        for backend in ('ufw','firewalld'):
+            result=self.run_bash('firewall_system enable '+backend,FIREWALL_CONFIRM='YES')
+            self.assertNotEqual(result.returncode,0)
+        state=json.loads(self.switch_state.read_text())
+        self.assertFalse(state['ufw_active']);self.assertFalse(state['firewalld_active'])
+        commands=[json.loads(line) for line in self.switch_log.read_text().splitlines()]
+        self.assertNotIn(['ufw','--force','enable'],commands)
+        self.assertNotIn(['systemctl','enable','--now','firewalld.service'],commands)
+
+    def test_offline_configuration_failure_prevents_firewalld_start(self):
+        self.setup_firewall_switch(fail_config=True)
+        result=self.run_bash('firewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('配置检查失败',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['firewalld_active'])
+
+    def test_ipv6_ufw_configuration_must_be_readable_and_explicit(self):
+        self.setup_firewall_switch(listeners='LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=1,fd=3))')
+        (self.root/'etc/default/ufw').unlink()
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0);self.assertIn('无法确认 UFW IPv6',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+
+    def test_current_ssh_session_confirms_socket_activation_with_custom_port(self):
+        self.setup_firewall_switch(listeners='LISTEN 0 128 [::]:2022 [::]:* users:(("systemd",pid=1,fd=3))',effective='port 22')
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0)
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES',SSH_CONNECTION='192.0.2.1 40234 192.0.2.2 2022')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('TCP/2022',result.stdout);self.assertNotIn('TCP/22\n',result.stdout)
+
+    def test_confirmed_ssh_listeners_do_not_require_a_valid_default_sshd_config(self):
+        self.setup_firewall_switch(fail_sshd=True)
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('仅使用可确认',result.stderr)
+
+    def test_malformed_ssh_session_is_not_treated_as_safe_to_enable(self):
+        self.setup_firewall_switch()
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES',SSH_CONNECTION='not a session')
+        self.assertNotEqual(result.returncode,0);self.assertIn('无法确认当前 SSH 会话',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
+
+    def test_shared_node_ssh_permits_are_removed_from_node_ownership(self):
+        self.setup_firewall_switch();self.app.mkdir()
+        records=[{'backend':backend,'proto':'tcp','port':port,'marker':'old-node'} for backend in ('ufw','firewalld') for port in (2222,8443)]
+        ledger=self.app/'firewall-owned.json';ledger.write_text(json.dumps(records))
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(ledger.read_text()),[r for r in records if not (r['backend']=='ufw' and r['port']==2222)])
+        result=self.run_bash('firewall_system disable ufw\nfirewall_system enable firewalld',FIREWALL_CONFIRM='YES')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(ledger.read_text()),[r for r in records if r['port']==8443])
+        self.assertEqual(ledger.stat().st_mode&0o777,0o600)
+
+    def test_ssh_safeguard_allows_node_port_changes_and_cleanup(self):
+        self.managed_node();self.setup_firewall('ufw')
+        result=self.run_bash('begin_transaction update "$APP/firewall-owned.json"\nopen_firewall\nupdate_firewall_ownership\nTRANSACTION=""')
+        self.assertEqual(result.returncode,0,result.stderr)
+        # This is the leading, independent permit produced by enabling UFW with SSH protection.
+        state=json.loads(self.firewall_state.read_text())
+        state['ufw'].insert(0,'ALLOW 2222/tcp');state['ufw_markers']['2222/tcp']='sing-box-deploy SSH safeguard'
+        self.firewall_state.write_text(json.dumps(state))
+        result=self.run_bash('stage_changes edit_inbound_field hysteria2 /listen_port 9555\napply_changes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rules=json.loads(self.firewall_state.read_text())['ufw']
+        self.assertIn('ALLOW 2222/tcp',rules);self.assertIn('ALLOW 9555/udp',rules);self.assertNotIn('ALLOW 9443/udp',rules)
+        result=self.run_bash('begin_transaction update "$APP/firewall-owned.json"\nupdate_firewall_ownership remove-all\nTRANSACTION=""')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.firewall_state.read_text())['ufw'],['ALLOW 2222/tcp'])
+
+    def test_ssh_marker_on_a_deny_rule_does_not_bypass_cleanup_safety(self):
+        self.managed_node();self.setup_firewall('ufw')
+        result=self.run_bash('begin_transaction update "$APP/firewall-owned.json"\nopen_firewall\nupdate_firewall_ownership\nTRANSACTION=""')
+        self.assertEqual(result.returncode,0,result.stderr)
+        state=json.loads(self.firewall_state.read_text())
+        state['ufw'].insert(0,'DENY 2222/tcp');state['ufw_markers']['2222/tcp']='sing-box-deploy SSH safeguard'
+        self.firewall_state.write_text(json.dumps(state))
+        result=self.run_bash('begin_transaction update "$APP/firewall-owned.json"\nupdate_firewall_ownership remove-all')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('旧端口规则前存在非本脚本',result.stderr)
+        self.assertEqual(json.loads(self.firewall_state.read_text()),state)
+
+    def test_ufw_rule_counters_cannot_hide_a_prior_ssh_deny(self):
+        self.setup_firewall_switch(skip_insert=True,ufw_chains={'4':['[0:0] -A ufw-user-input -j DROP','-A ufw-user-input -p tcp --dport 2222 -j ACCEPT'],'6':[]})
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('优先放行',result.stderr)
+        self.assertFalse(json.loads(self.switch_state.read_text())['ufw_active'])
 
     def test_system_firewall_refuses_enabling_second_active_manager(self):
         result=self.run_bash('''firewall-cmd() { echo running; }
@@ -3146,10 +3743,8 @@ firewall_system enable ufw
         self.assertFalse((self.root/'ufw-mutations').exists())
 
     def test_system_firewall_does_not_report_success_when_command_fails(self):
-        result=self.run_bash('''firewall-cmd() { echo 'not running';return 252; }
-ufw() { if [[ "$1" == '--force' ]]; then return 9;fi;echo 'Status: inactive'; }
-firewall_system enable ufw
-''',FIREWALL_CONFIRM='YES')
+        self.setup_firewall_switch(fail_enable=True)
+        result=self.run_bash('firewall_system enable ufw',FIREWALL_CONFIRM='YES')
         self.assertEqual(result.returncode,9)
         self.assertNotIn('已执行',result.stderr)
 

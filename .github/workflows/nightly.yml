@@ -1,0 +1,49 @@
+name: Nightly real-core integration
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hopping:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      SING_BOX_VERSION: '1.14.4'
+      # Official v1.14.4 release asset digest (GitHub API); no checksum asset is published.
+      SING_BOX_SHA256: '699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install namespace and firewall dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 openssl curl ca-certificates iproute2 nftables iptables util-linux
+      - name: Download and verify fixed official core
+        run: |
+          workdir="$(mktemp -d "$RUNNER_TEMP/sing-box.XXXXXX")"
+          archive="sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          curl --fail --show-error --silent --location --retry 3 \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${archive}" \
+            --output "$workdir/$archive"
+          printf '%s  %s\n' "$SING_BOX_SHA256" "$workdir/$archive" > "$workdir/checksums.sha256"
+          sha256sum --check --strict "$workdir/checksums.sha256"
+          tar -xzf "$workdir/$archive" -C "$workdir"
+          binary="$workdir/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
+          "$binary" version
+          printf 'SING_BOX=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Real HY2 stream, hopping and firewall cleanup
+        # The test refuses to touch the parent network namespace; unsupported runners fail.
+        run: sudo python3 -B tests/hopping_integration.py --sing-box "$SING_BOX"

@@ -1,10 +1,10 @@
 # sing-box-deploy
 
-一个面向 Linux 服务器的 sing-box 部署与管理脚本。脚本提供中文交互菜单，可从官方软件源安装稳定版 sing-box，生成 **VLESS Reality + Hysteria2 + AnyTLS + TUIC** 四组入站，并将流量按 **Google / YouTube、AI、其他** 分流到三组上游 SOCKS5。
+一个面向 Linux 服务器的 sing-box 部署与管理脚本。脚本提供中文交互菜单，可从官方软件源安装稳定版 sing-box，生成 **VLESS Reality + Hysteria2 + AnyTLS + TUIC** 四组入站，并将流量按 **Google / YouTube、AI、其他** 分流到三组上游代理（每组可独立选择 SOCKS5 或 HTTPS）。
 
 同时提供配置编辑、待应用配置、事务回滚、防火墙归属管理、端口跳跃、备份恢复、内核更新和卸载等日常运维功能。
 
-> 仓库中的部署脚本是 `sing-box-deploy.sh`。测试位于 `tests/`，不会修改本机真实配置。
+> 源码入口是 `sing-box-deploy.sh`，Python 逻辑位于 `lib/sb_deploy/`；可打包生成独立发布脚本。测试使用隔离环境，不会修改本机真实部署。
 
 ---
 
@@ -17,7 +17,7 @@
   - Hysteria2（UDP，Salamander 混淆，自签证书）
   - AnyTLS（TCP，自签证书）
   - TUIC（UDP / QUIC，自签证书）
-- **三组 SOCKS5 出口**：
+- **三组独立代理出口（SOCKS5 / HTTPS）**：
   - Google / YouTube → `google-socks`
   - 其余 AI 流量 → `ai-socks`
   - 其他公网流量 → `other-socks`
@@ -45,7 +45,7 @@
   - GitHub 规则集下载地址
   - Reality 握手目标（默认 `la.mirrors.clouvider.net:443`）
   - `api.ipify.org`（未指定公网 IPv4 时用于自动探测）
-- 安装时会自动安装依赖：`curl`、`ca-certificates`、`openssl`、`python3`、`iproute2` / `iproute`
+- 安装时会自动安装依赖：`curl`、`ca-certificates`、`openssl`、`python3`、`iproute2` / `iproute`、`diffutils`（提供更新校验使用的 `cmp`）
 
 > 脚本不会自动安装或接管 UFW / firewalld；检测到已启用的管理工具时才会添加本脚本拥有的规则。
 > 开启端口跳跃但系统没有 nftables / iptables 时，脚本会通过系统包管理器安装 nftables。
@@ -62,7 +62,13 @@ cd sb-deploy
 chmod +x sing-box-deploy.sh
 ```
 
-如果只是单文件使用，也可以直接复制 `sing-box-deploy.sh` 到服务器。
+源码版需同时保留 `sing-box-deploy.sh` 和 `lib/`。需要单文件复制到服务器时，先在源码目录打包：
+
+```bash
+python3 -B scripts/build_release.py --output dist/sing-box-deploy.sh
+```
+
+将生成的 `dist/sing-box-deploy.sh` 单独复制到服务器即可运行，不需要安装 Python 第三方依赖。打包保留源码顶部的默认参数；修改默认值后需重新打包。以下命令可用于源码版，也可用于生成的发布脚本。
 
 ### 2. 进入管理菜单
 
@@ -92,13 +98,13 @@ sudo env \
 
 上面仅演示非交互参数形式。生产环境不建议把真实密码直接写在命令行中，可改用下方的 `0600` 环境文件方式，避免密码进入 shell 历史和进程参数。
 
-也可以交互安装，脚本会提示端口和 SOCKS5 参数。安装前会确认：
+也可以交互安装，脚本会提示端口、代理协议和连接参数。安装前会确认：
 
 - `/etc/sing-box/config.json` 必须不存在
 - `sing-box.service` 不得处于运行状态
 - 部署目录和 `sb-manager` 不得已存在
 - 目标端口未被占用
-- SOCKS5 上游认证和 CONNECT 可用
+- 代理上游认证和 CONNECT 可用，HTTPS 同时校验 TLS 证书
 - Reality 握手目标 TLS 1.3 与证书校验通过
 
 安装完成后会自动安装快捷命令：
@@ -107,7 +113,7 @@ sudo env \
 sudo sb-manager
 ```
 
-`sb-manager` 实际执行的是 `/var/lib/sing-box/deployment/manager.sh`。
+`sb-manager` 实际执行的是 `/var/lib/sing-box/deployment/manager.sh`。安装或更新快捷命令时会自动打包，因此已安装入口不依赖原仓库目录，现有事务回滚也覆盖打包失败。
 
 ---
 
@@ -151,7 +157,7 @@ sudo sb-manager
 
 ## 配置修改流程
 
-除安装和恢复外，协议、端口、SOCKS5、凭据和跳跃设置的修改都会先写入待应用区：
+除安装和恢复外，协议、端口、代理出口、凭据和跳跃设置的修改都会先写入待应用区：
 
 ```text
 修改 → deployment/pending → 校验 → apply → 更新服务 / 防火墙 / 跳跃规则
@@ -214,7 +220,7 @@ sudo bash sing-box-deploy.sh restart
 ```
 
 - `status`：服务状态、监听检查、配置校验、跳跃服务检查
-- `check`：配置、SOCKS5 上游和可检查的 TLS 项目
+- `check`：配置、SOCKS5 / HTTPS 上游和可检查的 TLS 项目
 - `logs`：最近 80 行服务日志
 
 ### 节点资料
@@ -267,20 +273,36 @@ sudo bash sing-box-deploy.sh regenerate vless
 sudo bash sing-box-deploy.sh rotate-credentials
 ```
 
-### SOCKS5 出口
+### 代理出口（SOCKS5 / HTTPS）
 
 ```bash
-# 修改单组
-sudo bash sing-box-deploy.sh set-ai-socks
-sudo bash sing-box-deploy.sh set-google-socks
-sudo bash sing-box-deploy.sh set-other-socks
+# 修改单组：交互选择 socks5 或 https，回车保留当前协议和参数
+sudo bash sing-box-deploy.sh set-ai-proxy
+sudo bash sing-box-deploy.sh set-google-proxy
+sudo bash sing-box-deploy.sh set-other-proxy
 
 # 同时修改三组
-sudo bash sing-box-deploy.sh configure-socks
+sudo bash sing-box-deploy.sh configure-proxies
 
-# 开关三组出口的 TCP Fast Open
+# 开关三组出口的 TCP Fast Open（SOCKS5、HTTPS 均支持）
 sudo SOCKS_TFO=false bash sing-box-deploy.sh set-tfo
 ```
+
+每组独立选择协议，允许混用。`set-ai-socks` / `set-google-socks` / `set-other-socks` / `configure-socks` 继续作为兼容命令；旧 `*_SOCKS_HOST/PORT/USER/PASS` 参数也继续有效。
+
+例如，将 AI 出口暂存为 HTTPS，其他两组保持当前配置：
+
+```bash
+sudo AI_PROXY_PROTOCOL=https \
+  AI_PROXY_HOST=proxy.example.com AI_PROXY_PORT=443 \
+  AI_PROXY_SNI=proxy.example.com \
+  bash sing-box-deploy.sh set-ai-proxy
+sudo bash sing-box-deploy.sh apply
+```
+
+示例沿用当前认证信息；交互输入隐藏密码，也可在私密环境文件中填写 `AI_PROXY_USER` / `AI_PROXY_PASS`。HTTPS 支持 Basic 认证；用户名和密码均为空时不发送认证，交互输入 `:clear` 可清除当前认证。普通回车保留现有值。
+
+HTTPS 使用 sing-box 的 [`http` 出站与 TLS](https://sing-box.sagernet.org/configuration/outbound/http/)，默认启用证书和主机名校验。SNI 默认取代理地址，可通过 `*_PROXY_SNI` 独立设置；原有 HTTPS TLS 设置保留。提供的是 TCP CONNECT 代理能力，不提供 SOCKS5 UDP 转发。连接检查覆盖 TLS、SNI、认证与 CONNECT；非默认 HTTP/2/3、自定义 CONNECT 路径/请求头或尚不能准确模拟的高级 TLS 配置会明确提示需要手动核实，避免误报通过。
 
 默认路由顺序：
 
@@ -288,7 +310,7 @@ sudo SOCKS_TFO=false bash sing-box-deploy.sh set-tfo
 2. AI → `ai-socks`
 3. 其他流量 → `other-socks`
 
-Google 规则优先于 AI，避免 Gemini 等同时命中两组规则时走错出口。
+这些旧标签继续保留，切换协议不会改变分流引用；状态页按实际出站类型显示 SOCKS5 或 HTTPS。Google 规则优先于 AI，避免 Gemini 等同时命中两组规则时走错出口。所有出口修改仍仅暂存，需手动 `apply`，失败按原事务机制回滚。
 
 ### 添加可选协议
 
@@ -416,16 +438,21 @@ sudo UNINSTALL_CONFIRM=YES bash sing-box-deploy.sh uninstall
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AI_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | AI 流量上游 SOCKS5 |
-| `GOOGLE_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | Google / YouTube 上游 SOCKS5 |
-| `OTHER_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | 其他流量上游 SOCKS5 |
+| `AI_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | AI 流量代理地址、端口、认证（旧参数名保留） |
+| `GOOGLE_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | Google / YouTube 代理地址、端口、认证（旧参数名保留） |
+| `OTHER_SOCKS_HOST` / `PORT` / `USER` / `PASS` | 无 | 其他流量代理地址、端口、认证（旧参数名保留） |
+| `AI_PROXY_PROTOCOL` / `GOOGLE_PROXY_PROTOCOL` / `OTHER_PROXY_PROTOCOL` | 新安装 `socks5`，修改沿用当前协议 | 每组可设 `socks5` 或 `https`；源码对应 `DEFAULT_*_PROXY_PROTOCOL` |
+| `AI_PROXY_HOST` / `PORT` / `USER` / `PASS` | 沿用当前值 | AI 组通用参数；优先于同名 `AI_SOCKS_*` 旧参数 |
+| `GOOGLE_PROXY_HOST` / `PORT` / `USER` / `PASS` | 沿用当前值 | Google / YouTube 组通用参数 |
+| `OTHER_PROXY_HOST` / `PORT` / `USER` / `PASS` | 沿用当前值 | 其他流量组通用参数 |
+| `AI_PROXY_SNI` / `GOOGLE_PROXY_SNI` / `OTHER_PROXY_SNI` | 原有 SNI，否则代理地址 | HTTPS SNI；源码对应 `DEFAULT_*_PROXY_SNI`，显式空值重置为代理地址 |
 | `SERVER_IP` | 自动探测公网 IPv4 | 客户端导出地址，不写回服务端配置 |
 | `VLESS_PORT` | `443` | VLESS Reality TCP 端口 |
 | `HY2_PORT` | `443` | Hysteria2 UDP 端口 |
 | `ANYTLS_PORT` | `8443` | AnyTLS TCP 端口 |
 | `TUIC_PORT` | `10443` | TUIC UDP 端口 |
 | `REALITY_DOMAIN` | `la.mirrors.clouvider.net` | Reality 握手域名，同时作为默认 SNI |
-| `SOCKS_TFO` | `true` | 三组 SOCKS5 出站的 TCP Fast Open |
+| `SOCKS_TFO` | `true` | 三组 SOCKS5 / HTTPS 出站的 TCP Fast Open |
 | `HY2_BBR_PROFILE` | `standard` | `standard` / `conservative` / `aggressive` |
 | `HY2_HOP_PORTS` | 空（关闭） | 跳跃端口，例如 `20000:20100,30000` |
 | `HY2_HOP_INTERVAL` | `30s` | 跳跃间隔 |
@@ -481,6 +508,20 @@ bash /root/sb-deploy/sing-box-deploy.sh install
 - 默认生成自签证书；客户端必须信任证书，或使用 YAML 中的 SHA-256 指纹校验。
 - 分享链接本身不携带证书，导入后仍需确认客户端证书设置。
 - 通配监听地址无法直接确定公网地址；导出时可自动探测，或用 `SERVER_IP` 指定。
+
+自签证书默认有效期为 825 天，可在源码顶部调整 `DEFAULT_CERT_VALID_DAYS`，或用 `CERT_VALID_DAYS` 覆盖。`status`、`summary` 和主菜单显示实际配置中每张证书的剩余天数与到期时间；默认剩余 30 天内标黄，过期或无法读取时标红。预警阈值由 `DEFAULT_CERT_WARN_DAYS` / `CERT_WARN_DAYS` 设置。Reality 不使用此证书到期检查。
+
+续期托管自签证书：
+
+```bash
+sudo sb-manager renew-certs  # 仅暂存；保留私钥、SNI、SAN 和其他证书扩展
+sudo sb-manager apply        # 手动应用并重启；失败时回滚
+sudo sb-manager show-yaml    # 获取更新后的客户端资料
+```
+
+续期会改变证书 SHA-256 指纹，继续使用原有证书校验策略；**应用后必须重新导出并导入客户端节点**。多协议共用一张证书时仅续期一次；续期失败会恢复之前的待应用内容。
+
+自有证书可通过“修改协议配置”设置 `tls.certificate_path` / `tls.key_path`，也支持内嵌 PEM。外部、内嵌、备份导入的外部证书及 CA 签发证书不会被 `renew-certs` 覆盖。ACME 证书应由原工具续期，本脚本未新增 ACME 自动签发；使用动态证书配置时会提示无法离线确认到期时间。
 
 ---
 
@@ -541,13 +582,23 @@ sudo SERVER_IP=203.0.113.10 bash sing-box-deploy.sh export
 
 ## 测试
 
-运行完整单元测试：
+开发检查与分组测试：
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_deploy.py' -v
+python3 -m pip install -r requirements-dev.txt
+bash -n sing-box-deploy.sh
+shellcheck sing-box-deploy.sh
+ruff check .
+python3 -B tests/run_tests.py --group fast  # 直接导入 Python 模块、本地 TLS 代理、发布包契约及发行版检测
+python3 -B tests/run_tests.py --group slow  # 临时目录中的系统生命周期回归
+python3 -B tests/run_tests.py --group all   # 两组合并；可追加 -v
 ```
 
-测试使用临时目录、伪 systemd、伪软件包管理器和伪防火墙工具，不会修改本机真实部署。
+快组不依赖伪 systemd 或伪防火墙，验证配置编辑、SSH/UFW 解析、跳跃规划及独立发布包行为。慢组保留原有事务、失败回滚、安装、更新、卸载等测试，使用伪 systemd、软件包管理器和防火墙工具，不会修改本机真实部署。
+
+CI 对 PR 运行静态检查和 Debian 12 / Fedora 43 快组；推送到 main/master 或手动执行时，在两个发行版增加慢组。静态检查同时覆盖源码及生成的单文件发布脚本。APT/DNF 测试验证命令契约与回滚路径，容器运行不代表已经验证真实官方软件源安装或 systemd 服务管理。
+
+每日及手动 nightly 使用固定版本、固定 SHA-256 的官方 sing-box 运行下方真实跳跃测试；缺少 namespace 权限时明确失败，不跳过。
 
 运行真实 Hysteria2 端口跳跃集成测试（需要真实 sing-box 内核和 Linux namespace 支持）：
 
@@ -555,7 +606,7 @@ python3 -m unittest discover -s tests -p 'test_deploy.py' -v
 python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 ```
 
-依赖：Linux user namespace、`iproute2`、`nftables`、`iptables`、`curl`、`nsenter`。
+依赖：Linux user namespace、`iproute2`、`nftables`、`iptables`、`curl`、`nsenter`。测试明确移除单元测试夹具的伪防火墙和伪 `ss`，在新建的网络 namespace 内执行真实工具。
 
 ---
 
@@ -576,10 +627,33 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 ```text
 .
 ├── README.md
-├── sing-box-deploy.sh          # 主部署与管理脚本
-└── tests/
-    ├── test_deploy.py          # 单元/集成测试（伪系统环境）
-    └── hopping_integration.py  # 真实 Hysteria2 跳跃测试（network namespace）
+├── sing-box-deploy.sh          # Bash 管理界面、事务、systemd 与包管理
+├── lib/
+│   ├── runner.py              # 保留 stdin/argv 的模块调用入口
+│   └── sb_deploy/
+│       ├── __init__.py        # Python 包入口
+│       ├── configuration.py   # 配置生成、代理出口编辑、TLS 路径与字段修改
+│       ├── nodes.py           # 协议配置、动态菜单及客户端导出
+│       ├── certificates.py    # 到期检测与托管自签续期
+│       ├── firewall.py        # 防火墙状态、SSH 保护及规则归属
+│       ├── hopping.py         # 跳跃端口规划与 NAT 生命周期
+│       ├── network.py         # 地址检查与连接探测
+│       ├── backup.py          # 私密归档、校验及恢复
+│       └── bundle.py          # 源码与独立发布包共用的打包逻辑
+├── scripts/build_release.py   # 生成 dist/sing-box-deploy.sh；不提交生成文件
+├── tests/
+│   ├── run_tests.py           # fast / slow / all 分组入口
+│   ├── test_modules.py        # 模块直接单测与发布包契约（快组）
+│   ├── test_https_proxy.py    # 本地真实 TLS 代理与认证探测（快组）
+│   ├── test_deploy.py         # 隔离系统生命周期回归（慢组）
+│   └── hopping_integration.py # 真实 Hysteria2 跳跃测试（network namespace）
+├── .github/workflows/
+│   ├── ci.yml                # 静态检查与 Debian/Fedora 测试
+│   └── nightly.yml           # 固定真实内核的每日网络集成
+├── requirements-dev.txt       # 固定开发检查工具；服务器无需安装
+├── ruff.toml                 # Python 静态检查规则
+├── .shellcheckrc              # 有意的暂存子进程作用域说明
+└── .gitignore                # 排除缓存与生成的发布包
 ```
 
 ---

@@ -1,0 +1,10 @@
+target-version = "py310"
+line-length = 100
+extend-exclude = ["dist"]
+
+[lint]
+select = ["E4", "E9", "F", "I"]
+
+[lint.per-file-ignores]
+"scripts/build_release.py" = ["E402"]
+"tests/test_modules.py" = ["E402"]
