@@ -87,24 +87,54 @@ ui() {
     reset=$'\033[0m'
     case "$kind" in
       title) color=$'\033[1;36m' ;;
+      section) color=$'\033[1;35m' ;;
       item) color=$'\033[36m' ;;
+      info) color=$'\033[0;37m' ;;
+      muted) color=$'\033[2;37m' ;;
       success) color=$'\033[1;32m' ;;
       warning) color=$'\033[1;33m' ;;
       error) color=$'\033[1;31m' ;;
-      *) color=$'\033[34m' ;;
+      *) color=$'\033[0;37m' ;;
     esac
   fi
   printf '%s%s%s%s\n' "$color" "$text" "$reset" "$tail"
 }
 
+# A light visual separator used between UI sections.
+ui_rule() {
+  local width="${1:-46}" glyph="${2:-─}" indent="${3:-}" line
+  printf -v line '%*s' "$width" ''
+  line="${line// /$glyph}"
+  ui muted "${indent}${line}"
+}
+
 menu_choices() {
-  local line
+  local line text indent number rest
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == *卸载* || "$line" == *关闭系统防火墙* ]]; then ui error "$line"
-    elif [[ "$line" == *应用配置并重启* || "$line" == *'· 开启'* ]]; then ui success "$line"
-    elif [[ "$line" == *重新生成* || "$line" == *含访问凭据* ]]; then ui warning "$line"
-    elif [[ "$line" =~ ^([[:space:]]*[0-9]+\.)(.*)$ ]]; then
-      ui item "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    if [[ "$line" == '@@GROUP@@'* ]]; then
+      printf '\n'
+      ui section "  ── ${line#@@GROUP@@} ──"
+    elif [[ "$line" == *卸载* || "$line" == *关闭系统防火墙* ]]; then
+      indent="${line%%[![:space:]]*}"
+      text="${line#"$indent"}"
+      printf '%s' "$indent"; ui error "$text"
+    elif [[ "$line" == *应用配置并重启* || "$line" == *'· 开启'* ]]; then
+      indent="${line%%[![:space:]]*}"
+      text="${line#"$indent"}"
+      printf '%s' "$indent"; ui success "$text"
+    elif [[ "$line" == *重新生成* || "$line" == *含访问凭据* || "$line" == *需确认* || "$line" == *待应用* ]]; then
+      indent="${line%%[![:space:]]*}"
+      text="${line#"$indent"}"
+      printf '%s' "$indent"; ui warning "$text"
+    elif [[ "$line" =~ ^[[:space:]]*0\.[[:space:]] ]]; then
+      text="${line#"${line%%[![:space:]]*}"}"
+      ui muted "  $text"
+    elif [[ "$line" =~ ^([[:space:]]*)([0-9]+\.)([[:space:]]+)(.*)$ ]]; then
+      indent="${BASH_REMATCH[1]}"
+      number="${BASH_REMATCH[2]}"
+      rest="${BASH_REMATCH[4]}"
+      # Keep the numbered prefix plain in redirected output and color only the number in a terminal.
+      ui item "${indent}${number}" " ${rest}"
     elif [[ -n "$line" ]]; then ui title "$line"
     else printf '\n'; fi
   done < <(printf '%s' "$1")
@@ -228,7 +258,7 @@ usage() {
   add-tuic             暂存生成 TUIC（独立 UUID/密码/证书），可传 TUIC_PORT、NEW_TUIC_SNI
   edit-field 标签 /字段路径 [JSON值|:remove]  逐项编辑或移除字段，保存后需 apply
   disable-hopping      暂存关闭 HY2 跳跃规则，保存后需 apply
-  edit-protocol [标签] [JSON文件]  完整编辑现有入站所有字段；交互时调用 EDITOR
+  edit-protocol [标签] [JSON文件]  完整编辑现有入站所有字段；默认 nano，VISUAL / EDITOR 可覆盖
   set-protocol-defaults 更新已有协议的 TLS 10s、HY2 ignore_client_bandwidth 及 TUIC 默认参数
   SERVER_IP=公网地址    可覆盖客户端导出地址；不写回服务端配置
   export-yaml          可选导出 Clash/Mihomo proxies.yaml；普通生成/导出只在结果中显示 YAML
@@ -332,14 +362,22 @@ EOF
 
 show_occupied_ports() {
   OCCUPIED_PORTS=''
-  ui title '── 当前已占用端口 · TCP / UDP ──'
+  local count=0
+  printf '\n' >&2
+  ui title '  ╭─ 当前已占用端口 · TCP / UDP ──────────────' >&2
   if ! command -v ss >/dev/null; then
     warn '无法读取占用情况：未安装 ss，请安装 iproute2 / iproute 后再核实端口。'
     return 0
   fi
   OCCUPIED_PORTS="$(ss -H -lntup)" || { warn '读取端口失败，请先检查系统网络工具。'; return 1; }
-  printf '%s\n' "${OCCUPIED_PORTS:-当前没有监听端口}"
-  ui info 'TCP 与 UDP 分别判断；本机占用情况不代表云安全组已放行。'
+  if [[ -n "$OCCUPIED_PORTS" ]]; then
+    count="$(printf '%s\n' "$OCCUPIED_PORTS" | grep -c '[^[:space:]]' || true)"
+    ui muted "  │  共 ${count:-0} 条监听记录" >&2
+    printf '  %s\n' "$OCCUPIED_PORTS" >&2
+  else
+    ui muted '  │  当前没有监听端口' >&2
+  fi
+  ui muted '  ╰─ TCP 与 UDP 分别判断；本机占用情况不代表云安全组已放行。' >&2
 } >&2
 
 read_ports() {
@@ -671,6 +709,7 @@ check_listeners() {
 
 start_official_unit() {
   # Official package unit reads /etc/sing-box/*.json with -C; keep only config.json there.
+  systemctl daemon-reload
   systemctl restart "$UNIT"
   sleep 2
   systemctl is-active --quiet "$UNIT" || {
@@ -960,9 +999,10 @@ firewall_status() {
   need_root
   local automatic
   automatic="$(firewall_auto)"
-  ui title '防火墙状态'
-  ui info "脚本自动放行端口：$automatic"
-  python3 - "${1:-summary}" "$APP/firewall-owned.json" <<'PYCODE'
+  printf '\n'
+  ui title '  ╭─ 防火墙状态 ──────────────────────────────'
+  ui info "  │  脚本自动放行端口：$automatic"
+  python3 - "${1:-summary}" "$APP/firewall-owned.json" <<'PYCODE' | sed 's/^/  │  /'
 import json, os, pathlib, shutil, subprocess, sys
 verbose=sys.argv[1]=='details';active=False;found=False
 
@@ -1006,6 +1046,7 @@ if verbose:
     print(json.dumps(rules,indent=2,ensure_ascii=False))
     print('云安全组不在本机防火墙状态内，请在云平台查看。')
 PYCODE
+  ui muted '  ╰─ 云安全组不在本机防火墙状态内，请在云平台单独核对。'
 }
 
 firewall_system() {
@@ -1063,7 +1104,22 @@ firewall_system() {
 }
 
 firewall_hints() {
-  log "Cloud firewall/security group must allow TCP/$VLESS_PORT${ANYTLS_PORT:+ and TCP/$ANYTLS_PORT} and UDP/$HY2_PORT${TUIC_PORT:+ and UDP/$TUIC_PORT}; confirm actual client connectivity."
+  [[ -f "$CONFIG" ]] || return 0
+  local listeners proto port label endpoint ports=''
+  local -A seen=()
+  listeners="$(configuration_listeners)" || return 1
+  while read -r proto port label; do
+    [[ -n "$port" ]] || continue
+    endpoint="${proto^^}/$port"
+    [[ ! ${seen[$endpoint]+present} ]] || continue
+    seen[$endpoint]=1
+    ports+="${ports:+、}$endpoint"
+  done <<< "$listeners"
+  if [[ -n "$ports" ]]; then
+    log "配置中的监听端口：$ports；请在云防火墙/安全组确认放行，公网可达性需客户端验证。"
+  else
+    log '当前配置没有 TCP/UDP 监听端口。'
+  fi
 }
 
 fresh_install() {
@@ -1370,32 +1426,50 @@ record_runtime_state() {
 
 show_dashboard() {
   need_root
-  local identity='' snapshot='' version='' pid='' active=0
+  local identity='' snapshot='' version='' pid='' active=0 pending=0 line
   if systemctl is-active --quiet "$UNIT"; then active=1; fi
+  [[ ! -f "$APP/pending/config.json" ]] || pending=1
+  printf '\n'
+  if (( pending )); then
+    ui title '  ╭─ 运行概况 ────────────────────── 有未应用修改'
+  else
+    ui title '  ╭─ 运行概况 ────────────────────────────────'
+  fi
   if (( active )) && identity="$(systemctl show "$UNIT" -p InvocationID --value)" && [[ -n "$identity" ]] && snapshot="$(node_config running-summary "$identity")"; then
-    ui success "${snapshot%%$'\n'*}"
-    printf '%s\n' "${snapshot#*$'\n'}"
+    ui success "  │  ● ${snapshot%%$'\n'*}"
+    while IFS= read -r line; do
+      ui info "  │  $line"
+    done <<< "${snapshot#*$'\n'}"
   else
     if (( active )) && pid="$(systemctl show "$UNIT" -p MainPID --value)" && [[ "$pid" =~ ^[1-9][0-9]*$ && -x "/proc/$pid/exe" ]]; then
       version="$("/proc/$pid/exe" version | sed -n '1s/.*version //p')"
-      ui success "服务：运行中    版本：${version:-未知}"
+      ui success "  │  ● 服务：运行中    版本：${version:-未知}"
     else
       if [[ -x "$BIN" ]]; then version="$("$BIN" version | sed -n '1s/.*version //p')"; fi
-      if (( active )); then ui success "服务：运行中    已安装版本：${version:-未知}"
-      else ui warning "服务：已停止或异常    已安装版本：${version:-未安装}"; fi
+      if (( active )); then ui success "  │  ● 服务：运行中    已安装版本：${version:-未知}"
+      else ui warning "  │  ○ 服务：已停止或异常    已安装版本：${version:-未安装}"; fi
     fi
     if [[ -f "$CONFIG" ]]; then
-      if (( active )); then ui warning '运行配置未确认；以下为已保存的配置文件（通过本工具启动或应用后可确认）。'
-      else ui title '已保存配置：'; fi
-      node_config summary
+      if (( active )); then
+        ui warning '  │  运行配置未确认；以下为已保存的配置文件（通过本工具启动或应用后可确认）。'
+      else
+        ui muted '  │  已保存配置：'
+      fi
+      node_config summary | while IFS= read -r line; do ui info "  │  $line"; done
     else
-      ui warning '尚未安装节点。'
+      ui warning '  │  尚未安装节点。'
     fi
   fi
-  if [[ -f "$APP/pending/config.json" ]]; then
+  if (( pending )); then
+    ui muted '  ╰─ 修改配置后需执行“应用配置并重启”才会生效。'
+    printf '\n'
     ui warning '待应用配置（尚未生效）：'
-    (CONFIG="$APP/pending/config.json"; APP="$APP/pending"; node_config summary)
+    (CONFIG="$APP/pending/config.json"; APP="$APP/pending"; node_config summary) | while IFS= read -r line; do
+      ui warning "  · $line"
+    done
     ui warning '执行 apply 应用并重启；执行 discard-pending 丢弃修改。'
+  else
+    ui muted '  ╰─ 修改配置后需执行“应用配置并重启”才会生效。'
   fi
 }
 
@@ -1465,8 +1539,8 @@ edit_protocol() {
   cp "$TEMP/original-inbound.json" "$TEMP/inbound.json"
   if [[ -z "$input" ]]; then
     [[ -t 0 ]] || die '非交互编辑请提供完整入站 JSON 文件。'
-    read -r -a editor <<< "${VISUAL:-${EDITOR:-vi}}"
-    command -v "${editor[0]}" >/dev/null || die '编辑器未安装，请设置 EDITOR 或提供 JSON 文件。'
+    read -r -a editor <<< "${VISUAL:-${EDITOR:-nano}}"
+    command -v "${editor[0]}" >/dev/null || die "编辑器 ${editor[0]} 未安装，请先安装该编辑器、设置 VISUAL / EDITOR 或提供 JSON 文件。"
     "${editor[@]}" "$TEMP/inbound.json"
     input="$TEMP/inbound.json"
   fi
@@ -2068,6 +2142,7 @@ load_node_settings() {
 
 restart_checked() {
   [[ ${STAGING:-0} != 1 ]] || return 0
+  systemctl daemon-reload
   systemctl restart "$UNIT"
   sleep 2
   if ! systemctl is-active --quiet "$UNIT"; then
@@ -2462,40 +2537,101 @@ PYCODE
 
 status_cmd() {
   need_root
-  local result=0 tcp udp
-  systemctl status "$UNIT" --no-pager -l || result=1
+  local result=0 state='' reload='' rc running=0 endpoints proto port label output hopping_enabled hop_state
+  printf '\n'
+  ui title '  ╭─ 服务状态 ────────────────────────────────'
+  if ! state="$(systemctl show "$UNIT" --property=ActiveState --value)"; then
+    ui error '无法查询 sing-box 服务状态，请检查 systemd 或服务文件。' >&2
+    result=1
+  fi
+  ui muted '  ├─ systemd 详情'
+  if systemctl status "$UNIT" --no-pager -l --lines=0; then :
+  else
+    rc=$?
+    if [[ "$rc" != 3 ]]; then ui error "服务详情查询失败（退出码 $rc）。" >&2; result=1; fi
+  fi
+  case "$state" in
+    active|reloading|refreshing) running=1; ui success '  ├─ 服务：运行中' ;;
+    inactive) ui info '  ├─ 服务：已停止；可通过服务管理启动。' ;;
+    activating|deactivating) ui warning "  ├─ 服务正在切换状态：$state，请稍后查看。" ;;
+    failed) ui error '  ├─ 服务：启动或运行失败，请通过“查看日志”检查原因。' >&2; result=1 ;;
+    *) ui error "  ├─ 无法确认服务状态：${state:-未知}。" >&2; result=1 ;;
+  esac
+  if reload="$(systemctl show "$UNIT" --property=NeedDaemonReload --value)"; then
+    case "$reload" in
+      yes) ui warning '  ├─ 服务文件已变化，systemd 尚未重新加载；手动启动、重启或应用配置时会先重新加载。' ;;
+      no) ;;
+      *) ui error '  ├─ 无法确认服务文件是否需要重新加载。' >&2; result=1 ;;
+    esac
+  else ui error '  ├─ 无法查询服务文件的重新加载状态。' >&2; result=1; fi
   if [[ -f "$CONFIG" ]]; then
+    ui muted '  ├─ 当前配置'
     node_config summary || result=1
-    local endpoints proto port label
     endpoints="$(configuration_listeners)" || result=1
+    ui muted '  ├─ 监听检查'
     while read -r proto port label; do
       [[ -n "$port" ]] || continue
-      printf '\n=== %s %s %s ===\n' "$label" "${proto^^}" "$port"
-      if [[ "$proto" == udp ]]; then tcp="$(ss -H -lunp "( sport = :$port )")" || result=1
-      else tcp="$(ss -H -ltnp "( sport = :$port )")" || result=1; fi
-      printf '%s\n' "$tcp"
-      [[ "$tcp" == *'"sing-box"'* ]] || result=1
+      printf '\n'
+      ui title "  ── ${label} ${proto^^} ${port} ──"
+      if [[ "$proto" == udp ]]; then
+        if ! output="$(ss -H -lunp "( sport = :$port )")"; then
+          ui error "无法查询 UDP/$port 的监听情况。" >&2; result=1; continue
+        fi
+      else
+        if ! output="$(ss -H -ltnp "( sport = :$port )")"; then
+          ui error "无法查询 TCP/$port 的监听情况。" >&2; result=1; continue
+        fi
+      fi
+      if [[ -n "$output" ]]; then printf '  %s\n' "$output"
+      else ui info '  当前没有监听。'; fi
+      if (( running )) && [[ "$output" != *'"sing-box"'* ]]; then
+        ui error "服务运行中，但未发现 $label ${proto^^}/$port 的 sing-box 监听。" >&2
+        result=1
+      fi
     done <<< "$endpoints"
   fi
-  printf '\n=== Recent log ===\n'
-  journalctl -u "$UNIT" -n 20 --no-pager || result=1
-  printf '\n=== Config check ===\n'
+  printf '\n'
+  ui muted '  ├─ 配置校验'
   if [[ -x "$BIN" && -f "$CONFIG" ]]; then
-    check_configuration || result=1
+    if check_configuration; then ui success '  │  配置校验通过。'
+    else ui error '  │  配置校验失败，请检查上方具体错误。' >&2; result=1; fi
   else
-    log 'sing-box binary or configuration is missing.'
+    ui error '  │  sing-box 内核或配置文件不存在。' >&2
     result=1
   fi
   if [[ -f "$APP/hopping.json" ]]; then
-    local hopping_enabled
-    hopping_enabled="$(python3 - "$APP/hopping.json" <<'PYCODE'
+    if hopping_enabled="$(python3 - "$APP/hopping.json" <<'PYCODE'
 import json,sys
 print('yes' if json.load(open(sys.argv[1])).get('enabled') else 'no')
 PYCODE
-)" || result=1
-    if [[ "$hopping_enabled" == yes ]]; then systemctl status "$HOP_UNIT" --no-pager -l || result=1; fi
+)"; then
+      if [[ "$hopping_enabled" == yes ]]; then
+        ui muted '  ├─ 端口跳跃'
+        if ! hop_state="$(systemctl show "$HOP_UNIT" --property=ActiveState --value)"; then
+          ui error '无法查询端口跳跃服务状态。' >&2; result=1
+        fi
+        if systemctl status "$HOP_UNIT" --no-pager -l --lines=0; then :
+        else
+          rc=$?
+          if [[ "$rc" != 3 ]]; then
+            ui error "端口跳跃服务查询失败（退出码 $rc）。" >&2
+            result=1
+          fi
+        fi
+        if [[ "$hop_state" == failed || -z "$hop_state" ]]; then
+          ui error '端口跳跃服务异常，请查看服务日志。' >&2; result=1
+        elif (( running )) && [[ "$hop_state" != active ]]; then
+          ui error 'sing-box 已运行，但端口跳跃服务未运行。' >&2; result=1
+        fi
+      fi
+    else ui error '无法读取端口跳跃设置。' >&2; result=1; fi
   fi
-  firewall_hints
+  firewall_hints || result=1
+  if (( result == 0 )); then
+    ui success '  ╰─ 状态检查完成，未发现异常。'
+  else
+    ui warning '  ╰─ 状态检查完成，发现需要处理的异常。'
+  fi
   return "$result"
 }
 
@@ -2532,6 +2668,7 @@ service_cmd() {
       require_no_pending
       if ! systemctl is-active --quiet "$UNIT"; then
         check_configuration
+        systemctl daemon-reload
         systemctl start "$UNIT"
         systemctl is-active --quiet "$UNIT"
         record_runtime_state
@@ -2544,6 +2681,8 @@ service_cmd() {
 check_connections() {
   need_root
   [[ -f "$CONFIG" && -x "$BIN" ]] || die '请指定有效配置文件及已安装的 sing-box 内核。'
+  printf '\n' >&2
+  ui title '  ╭─ 连接检查 ────────────────────────────────' >&2
   "$BIN" check -c "$CONFIG"
   local index
   local -a probes=()
@@ -2616,13 +2755,17 @@ sys.stdout.write('READY\0')
 PYCODE
 )
   (( ${#probes[@]} >= 1 && (${#probes[@]}-1)%5 == 0 )) && [[ "${probes[-1]}" == READY ]] || die '无法完成当前配置的连接检查。'
+  if (( ${#probes[@]} > 1 )); then
+    ui muted '  ── SOCKS5 连通性 ──' >&2
+  fi
   for ((index=0; index<${#probes[@]}-1; index+=5)); do
-    log "Checking SOCKS5 outbound ${probes[index]}"
+    log "检查 SOCKS5 出口：${probes[index]}"
     export PROBE_SOCKS_HOST="${probes[index+1]}" PROBE_SOCKS_PORT="${probes[index+2]}" PROBE_SOCKS_USER="${probes[index+3]}" PROBE_SOCKS_PASS="${probes[index+4]}"
     check_socks probe
     unset PROBE_SOCKS_HOST PROBE_SOCKS_PORT PROBE_SOCKS_USER PROBE_SOCKS_PASS
   done
   log '当前配置、已配置 SOCKS5 及可检查的 TLS 项目检查通过；公网节点连通性仍需客户端验证。'
+  ui success '  ╰─ 检查完成，未发现异常。' >&2
 }
 
 menu_action() {
@@ -2632,40 +2775,64 @@ menu_action() {
     ui success '操作完成。'
     [[ "${1:-}" != apply ]] || refresh=1
   else
-    ui error "操作未完成（退出码 $?），请查看上方错误；有备份时请保留。" >&2
+    local rc=$?
+    if [[ "${1:-}" == status ]]; then
+      ui warning "状态检查完成，发现异常（退出码 $rc），请查看上方具体提示。" >&2
+    else
+      ui error "操作未完成（退出码 $rc），请查看上方错误；有备份时请保留。" >&2
+    fi
   fi
   [[ -f "$SCRIPT_PATH" ]] || exit 0
   local answer
-  read -r -p '按回车返回菜单。' answer || return 0
+  read -r -p '  按回车返回菜单…' answer || return 0
   if (( refresh )); then exec bash "$SCRIPT_PATH" menu; fi
 }
 
-# Labels and actions share one list; numbering and dispatch follow that list.
+# Labels and actions share one list; menu groups use @group and are never numbered.
 run_menu() {
-  local title="$1" header="$2" choice action index text count provider=''
+  local title="$1" header="$2" choice action index text count provider='' width number padding
   shift 2
-  local -a entries=("$@")
+  local -a entries=("$@") actions=()
   if (( ${#entries[@]} == 1 )) && [[ "${entries[0]}" == @* ]]; then provider="${entries[0]#@}"; fi
   while true; do
     if [[ -n "$provider" ]]; then mapfile -d '' -t entries < <("$provider"); fi
-    count=$((${#entries[@]}/2))
-    printf '\n'; ui title "╭─ $title"
-    ui info '│ 选择编号操作 · 0 返回 / 退出'
-    ui info '╰────────────────────────────────────────'
-    if [[ -n "$header" ]] && ! bash "$SCRIPT_PATH" "$header"; then ui warning '配置摘要读取失败，请查看状态和日志。'; fi
-    text=''
+    count=0
     for ((index=0; index<${#entries[@]}; index+=2)); do
-      text+=" $((index/2+1)). ${entries[index]}"$'\n'
+      if [[ "${entries[index+1]}" != '@group' ]]; then count=$((count+1)); fi
+    done
+    width=${#count}
+    actions=()
+    text=''
+    number=0
+    for ((index=0; index<${#entries[@]}; index+=2)); do
+      if [[ "${entries[index+1]}" == '@group' ]]; then
+        text+="@@GROUP@@${entries[index]}"$'\n'
+        continue
+      fi
+      number=$((number+1))
+      printf -v padding '%*d' "$width" "$number"
+      text+=" ${padding}. ${entries[index]}"$'\n'
+      actions+=("${entries[index+1]}")
     done
     text+=' 0. 返回 / 退出'
+    printf '\n'
+    ui title "  ╭─ $title"
+    ui info  '  │  选择编号操作 · 0 返回 / 退出'
+    ui muted '  ╰──────────────────────────────────────────────'
+    if [[ -n "$header" ]]; then
+      if ! bash "$SCRIPT_PATH" "$header"; then ui warning '配置摘要读取失败，请查看状态和日志。'; fi
+      ui muted '  ── 操作菜单 ──'
+    fi
+    printf '\n'
     menu_choices "$text"
-    read -r -p '请选择：' choice || return 0
+    ui_rule 46 '─' '  '
+    read -r -p '  请选择编号：' choice || return 0
     [[ "$choice" != 0 ]] || return 0
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( ${#choice}>${#count} || 10#$choice<1 || 10#$choice>count )); then
-      ui warning '无效选择，请重新输入。'
+      ui warning '  无效选择，请输入菜单中的编号。'
       continue
     fi
-    action="${entries[(10#$choice-1)*2+1]}"
+    action="${actions[10#$choice-1]}"
     case "$action" in
       inbound:*) protocol_submenu "${action#inbound:}" ;;
       group:*) protocol_fields_menu "$ACTIVE_INBOUND" "${action#group:}" ;;
@@ -2745,9 +2912,11 @@ protocol_creation_menu() {
 
 firewall_menu() {
   run_menu '防火墙 · 状态与开关' firewall-status \
+    '脚本自动放行端口' @group \
     '查看状态和完整规则详情' firewall-details \
     '开启脚本自动放行端口（现有规则不变）' firewall-auto-on \
     '关闭脚本自动放行端口（保留现有规则）' firewall-auto-off \
+    '系统防火墙（需确认）' @group \
     '开启系统防火墙（需确认）' firewall-enable \
     '关闭系统防火墙（需确认）' firewall-disable
 }
@@ -2757,6 +2926,7 @@ socks_menu() {
     'AI' set-ai-socks \
     'Google / YouTube' set-google-socks \
     '其他流量' set-other-socks \
+    '共享设置' @group \
     '同时修改三组' configure-socks \
     '三组 SOCKS5 的 TFO 开关' set-tfo
 }
@@ -2764,14 +2934,16 @@ socks_menu() {
 export_menu() {
   run_menu '节点资料（含访问凭据）' '' \
     '查看已应用的连接参数和分享链接' show \
-    '查看已应用的客户端 JSON' show-json \
     '导出已应用节点到资料目录' export \
     '查看已应用的 Clash/Mihomo proxies YAML' show-yaml \
     '可选导出已应用的 proxies.yaml 文件' export-yaml
 }
 
 service_menu() {
-  run_menu '服务管理' '' '启动' start '停止' stop '重启' restart
+  run_menu '服务管理' '' \
+    '启动服务' start \
+    '停止服务' stop \
+    '重启服务（重新加载配置）' restart
 }
 
 # Port hopping is UDP REDIRECT into the same QUIC listener, never separate inbounds.
@@ -3387,22 +3559,27 @@ uninstall_cmd() {
 main_menu() {
   need_root
   [[ -t 0 ]] || { usage; return 0; }
-  run_menu '━━━━━━━━━━ sing-box 管理工具 ━━━━━━━━━━' summary \
+  run_menu 'sing-box 管理工具' summary \
+    '节点与协议' @group \
     '安装' install \
     '修改协议配置' @protocol_menu \
     '修改 SOCKS5 出口' @socks_menu \
     '查看 / 导出节点' @export_menu \
+    '服务与监控' @group \
     '启动 / 停止 / 重启服务' @service_menu \
     '查看状态' status \
     '查看日志' logs \
     '检查连接' check \
+    '维护与工具' @group \
     '安装 / 更新快捷命令 sb-manager' setup-manager \
     '更新 sing-box 内核' update \
     '手动备份已应用配置' backup \
     '恢复配置备份' restore \
     '卸载' uninstall \
+    '变更管理' @group \
     '应用配置并重启' apply \
     '丢弃待应用修改' discard-pending \
+    '高级操作' @group \
     '生成 / 重新生成协议' @protocol_creation_menu \
     '防火墙状态 / 详情 / 开关' @firewall_menu
 }
@@ -3452,7 +3629,7 @@ case "${1:-menu}" in
   set-google-socks) stage_changes set_socks_profile google ;;
   set-other-socks) stage_changes set_socks_profile other ;;
   configure-socks) stage_changes set_socks_profile ai google other ;;
-  status) status_cmd ;;
+  status) if status_cmd; then exit 0; else exit "$?"; fi ;;
   show) show_node_details ;;
   -h|--help|help) usage ;;
   *) usage; die 'Unknown action.' ;;

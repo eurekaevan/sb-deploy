@@ -73,6 +73,10 @@ systemctl() {{
   if [[ "$*" == *sing-box-hopping.service* ]]; then
     case "$1" in
       cat) [[ -f "$HOP_UNIT_FILE" ]] ;;
+      show) if [[ "$*" == *ActiveState* ]]; then
+        if [[ -f "$TEST_ROOT/hop-active" ]]; then echo active; else echo inactive; fi
+      fi ;;
+      status) [[ -f "$TEST_ROOT/hop-active" ]] || return 3 ;;
       is-active) [[ -f "$TEST_ROOT/hop-active" ]] ;;
       is-enabled) [[ -f "$TEST_ROOT/hop-enabled" ]] ;;
       enable) touch "$TEST_ROOT/hop-enabled"; if [[ "$*" == *--now* ]]; then hopping_runtime start || return 1; touch "$TEST_ROOT/hop-active"; fi ;;
@@ -85,6 +89,14 @@ systemctl() {{
   fi
   case "$1" in
     cat) [[ ! -f "$TEST_ROOT/no-unit" ]] ;;
+    show)
+      [[ ! -f "$TEST_ROOT/no-unit" ]] || return 4
+      case "$*" in
+        *ActiveState*) if [[ -n "${{TEST_SERVICE_STATE:-}}" ]]; then echo "$TEST_SERVICE_STATE"; elif [[ -f "$TEST_ROOT/active" ]]; then echo active; else echo inactive; fi ;;
+        *NeedDaemonReload*) echo "${{TEST_NEEDS_RELOAD:-no}}" ;;
+      esac ;;
+    start) touch "$TEST_ROOT/active" ;;
+    daemon-reload) [[ "${{TEST_RELOAD_FAIL:-0}}" != 1 ]] ;;
     is-active) [[ -f "$TEST_ROOT/active" ]] ;;
     is-enabled) if [[ -f "$TEST_ROOT/enabled" ]]; then echo enabled; else echo disabled; return 1; fi ;;
     stop) rm -f "$TEST_ROOT/active" ;;
@@ -93,7 +105,7 @@ systemctl() {{
       touch "$TEST_ROOT/active" ;;
     enable) touch "$TEST_ROOT/enabled" ;;
     disable) rm -f "$TEST_ROOT/enabled" ;;
-    status) [[ -f "$TEST_ROOT/active" ]] ;;
+    status) [[ -f "$TEST_ROOT/active" && "${{TEST_SERVICE_STATE:-active}}" != failed ]] || return 3 ;;
   esac
 }}
 journalctl() {{ :; }}
@@ -323,6 +335,99 @@ status_cmd
         (self.root / 'fail-check').unlink()
         result = self.run_bash(body.replace('status_cmd\n', 'ss() { :; }\nstatus_cmd\n'))
         self.assertNotEqual(result.returncode, 0)
+
+    def test_stopped_status_is_successful_read_only_and_has_no_recent_logs(self):
+        self.old_config();before=self.config.read_bytes()
+        result=self.run_bash('ss() { :; }; journalctl() { echo UNEXPECTED_LOGS; return 1; }; status_cmd')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('服务：已停止',result.stdout)
+        self.assertIn('配置校验通过',result.stdout)
+        self.assertIn('当前没有监听',result.stdout)
+        self.assertNotIn('Recent log',result.stdout);self.assertNotIn('UNEXPECTED_LOGS',result.stdout)
+        self.assertNotIn('Command failed',result.stderr)
+        self.assertEqual(self.config.read_bytes(),before)
+        calls=(self.root/'service.log').read_text()
+        self.assertNotIn('daemon-reload',calls);self.assertNotIn('restart',calls)
+        self.assertNotIn('start ',calls)
+        self.assertIn('--lines=0',calls)
+
+    def test_status_cli_reports_failed_state_without_generic_operation_error(self):
+        self.old_config()
+        dispatch=SOURCE[SOURCE.index('\ncase "${1:'):]
+        result=self.run_bash('set -- status\n'+dispatch,TEST_SERVICE_STATE='failed')
+        self.assertEqual(result.returncode,1,result.stderr)
+        self.assertIn('服务：启动或运行失败',result.stderr)
+        self.assertNotIn('Command failed at line',result.stderr)
+        result=self.run_bash('set -- status\n'+dispatch,TEST_SERVICE_STATE='inactive')
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_status_reports_query_and_config_errors_even_when_stopped(self):
+        self.old_config();(self.root/'fail-check').touch()
+        result=self.run_bash('status_cmd')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('配置校验失败',result.stderr)
+        (self.root/'fail-check').unlink();(self.root/'no-unit').touch()
+        result=self.run_bash('status_cmd')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('无法查询 sing-box 服务状态',result.stderr)
+
+    def test_reload_warning_is_read_only_and_explicit_restart_reloads_first(self):
+        self.old_config()
+        result=self.run_bash('ss() { :; }; status_cmd',TEST_NEEDS_RELOAD='yes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('systemd 尚未重新加载',result.stdout)
+        self.assertNotIn('daemon-reload',(self.root/'service.log').read_text())
+        result=self.run_bash('service_cmd restart')
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service.log').read_text().splitlines()
+        self.assertLess(calls.index('daemon-reload'),calls.index('restart sing-box.service'))
+
+    def test_failed_daemon_reload_prevents_start_or_restart(self):
+        self.old_config()
+        for operation in ('start','restart'):
+            with self.subTest(operation=operation):
+                result=self.run_bash('service_cmd '+operation,TEST_RELOAD_FAIL='1')
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse((self.root/'active').exists())
+        calls=(self.root/'service.log').read_text().splitlines()
+        self.assertNotIn('restart sing-box.service',calls);self.assertNotIn('start sing-box.service',calls)
+
+    def test_firewall_hint_lists_only_actual_configured_listeners(self):
+        self.old_config()
+        config=json.loads(self.config.read_text())
+        config['inbounds'].append({'type':'direct','tag':'custom','listen_port':12443,'network':'udp'})
+        self.config.write_text(json.dumps(config))
+        result=self.run_bash('firewall_hints',VLESS_PORT='28443',HY2_PORT='29443',ANYTLS_PORT='8443',TUIC_PORT='10443')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('TCP/443',result.stderr);self.assertIn('UDP/443',result.stderr);self.assertIn('UDP/12443',result.stderr)
+        self.assertNotIn('28443',result.stderr);self.assertNotIn('29443',result.stderr)
+        self.assertNotIn('TCP/8443',result.stderr);self.assertNotIn('UDP/10443',result.stderr)
+
+    def test_status_menu_labels_findings_without_operation_failure(self):
+        child=self.root/'status-child.sh'
+        child.write_text('echo "配置校验失败" >&2\nexit 1\n')
+        result=self.run_terminal(f'SCRIPT_PATH="{child}"; menu_action status','\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('状态检查完成，发现异常',result.stderr)
+        self.assertNotIn('操作未完成',result.stderr)
+
+    def test_stopped_status_does_not_hide_listener_query_errors(self):
+        self.old_config()
+        result=self.run_bash('ss() { return 1; }; status_cmd')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('无法查询 TCP/443',result.stderr)
+
+    def test_hopping_service_status_has_no_logs_and_distinguishes_stopped_main(self):
+        self.managed_node()
+        (self.app/'hopping.json').write_text(json.dumps({'version':1,'enabled':True,'backend':'nft','base_port':9443,'ports':['20000:20005'],'hop_interval':'30s'}))
+        result=self.run_bash('ss() { :; }; status_cmd')
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service.log').read_text()
+        self.assertIn('status sing-box-hopping.service --no-pager -l --lines=0',calls)
+        (self.root/'active').touch()
+        result=self.run_bash('status_cmd')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('端口跳跃服务未运行',result.stderr)
 
     def test_exit_signal_rolls_back(self):
         original = self.old_config()
@@ -2118,7 +2223,7 @@ fresh_install
         entry=self.root/'entry.sh'
         dispatch=SOURCE[SOURCE.index('\ncase "${1:'):]
         dispatch=dispatch.replace('install) fresh_install ;;','install) begin_transaction update "$CONFIG"; echo changed > "$CONFIG"; false ;;')
-        dispatch=dispatch.replace('status) status_cmd ;;','status) echo NEXT_ACTION_OK ;;')
+        dispatch=dispatch.replace('status) if status_cmd; then exit 0; else exit "$?"; fi ;;','status) echo NEXT_ACTION_OK ;;')
         dispatch=dispatch.replace('summary) need_root; node_config summary; "$BIN" version | sed -n \'1p\' ;;','summary) echo 节点摘要 ;;')
         entry.write_text(self.prelude+'\nSCRIPT_PATH="'+str(entry)+'"\n'+dispatch)
         result=self.run_terminal('bash "'+str(entry)+'"','bad\n2\n0\n1\n\n6\n\n0\n')
