@@ -2,7 +2,6 @@
 
 import base64
 import json
-import shlex
 import sys
 import zlib
 from pathlib import Path
@@ -30,12 +29,18 @@ module = types.ModuleType("sb_deploy." + name)
 exec(compile(sources[name], name + ".py", "exec"), module.__dict__)
 getattr(module, action)()
 """
+    delimiter = "SB_PYTHON_BUNDLE_END"
+    if delimiter in bootstrap:
+        raise ValueError("Python bundle delimiter appears in the payload")
     runner = (
         START
         + PACKED
-        + "\npython_module() {\n  # shellcheck disable=SC2016 # Encoded module data must remain literal.\n  python3 -c "
-        + shlex.quote(bootstrap)
-        + ' "$@"\n}\n'
+        + "\npython_module() {\n"
+        + "  # Read the module from fd 3 so callers can keep using stdin for data.\n"
+        + f"  python3 /dev/fd/3 \"$@\" 3<<'{delimiter}'\n"
+        + bootstrap
+        + delimiter
+        + "\n}\n"
         + END
     )
     before, rest = source.split(START)

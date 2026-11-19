@@ -70,7 +70,7 @@ chmod +x sing-box-deploy.sh
 python3 -B scripts/build_release.py --output dist/sing-box-deploy.sh
 ```
 
-将生成的 `dist/sing-box-deploy.sh` 单独复制到服务器即可运行，不需要安装 Python 第三方依赖。打包保留源码顶部的默认参数；修改默认值后需重新打包。以下命令可用于源码版，也可用于生成的发布脚本。
+将生成的 `dist/sing-box-deploy.sh` 单独复制到服务器即可运行，不需要安装 Python 第三方依赖。打包保留源码顶部的默认参数；修改默认值后需重新打包。发布包通过 fd 3 把内嵌模块交给 Python，不占用命令行参数长度或调用方的 stdin。以下命令可用于源码版，也可用于生成的发布脚本。
 
 ### 2. 进入管理菜单
 
@@ -499,6 +499,8 @@ sudo UNINSTALL_CONFIRM=YES bash sing-box-deploy.sh uninstall
 
 > 建议在 root shell 中使用权限为 `0600` 的环境文件加载凭据，避免密码进入 shell 历史或进程参数。
 
+HTTPS 代理默认校验证书。已保存配置若包含 `tls.insecure: true`，`status`、`apply` 前摘要和 `check` 会显示醒目警告；仅在明确信任该中间代理时才应保留此设置。
+
 示例：
 
 ```bash
@@ -627,7 +629,7 @@ python3 -B tests/run_tests.py --group all   # 两组合并；可追加 -v
 
 快组不依赖伪 systemd 或伪防火墙，验证配置编辑、SSH/UFW 解析、跳跃规划及独立发布包行为。慢组保留原有事务、失败回滚、安装、更新、卸载等测试，使用伪 systemd、软件包管理器和防火墙工具，不会修改本机真实部署。
 
-CI 对 PR 运行静态检查和 Debian 12 / Fedora 43 快组；推送到 main/master 或手动执行时，在两个发行版增加慢组。静态检查同时覆盖源码及生成的单文件发布脚本。APT/DNF 测试验证命令契约与回滚路径，容器运行不代表已经验证真实官方软件源安装或 systemd 服务管理。
+CI 对 PR 和推送到 main/master 都运行静态检查及 Debian 12 / Ubuntu 24.04 / Fedora 43 的完整测试（快组和慢组）；事务回滚等隔离系统回归不再等到合并后才执行。静态检查同时覆盖源码及生成的单文件发布脚本。APT/DNF 测试验证命令契约与回滚路径，容器运行不代表已经验证真实官方软件源安装或 systemd 服务管理。
 
 每日及手动 nightly 使用固定版本、固定 SHA-256 的官方 sing-box 运行下方真实跳跃测试；缺少 namespace 权限时明确失败，不跳过。
 
@@ -647,6 +649,7 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 - 配置、私钥和备份均包含敏感信息，请限制为 root 可读。
 - 不要把真实密码提交到 Git、命令历史、公开日志或截图中。
 - sing-box 日志默认使用 `warn`，避免记录访问域名；只有在排障时才临时提高日志级别。
+- HTTPS 出口的 `tls.insecure: true` 会关闭证书校验；`status` 和 `check` 会显示警告，非必要不要使用。
 - 开启系统防火墙前，务必确认 SSH 已放行，避免把自己锁在服务器外。
 - 云安全组需要单独放行节点端口和全部跳跃端口。
 - 修改 SNI、凭据和协议前，先确认客户端可重新导入配置。
@@ -684,7 +687,6 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 │   └── nightly.yml           # 固定真实内核的每日网络集成
 ├── requirements-dev.txt       # 固定开发检查工具；服务器无需安装
 ├── ruff.toml                 # Python 静态检查规则
-├── .shellcheckrc              # 有意的暂存子进程作用域说明
 └── .gitignore                # 排除缓存与生成的发布包
 ```
 

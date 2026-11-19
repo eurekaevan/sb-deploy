@@ -92,7 +92,7 @@ hopping_runtime start
             self.send_response(200)
             self.send_header('Content-Length', str(130 * 1024))
             self.end_headers()
-            for i in range(130):
+            for _ in range(130):
                 self.wfile.write(b'x' * 1024)
                 self.wfile.flush()
                 time.sleep(0.1)

@@ -414,6 +414,23 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(values[:6], ["ai.example", "443", "", "", "https", "secure.example"])
         self.assertEqual(values[8], "READY")
 
+    def test_summary_warns_when_https_verification_is_disabled(self):
+        self.data["outbounds"] = [
+            {
+                "type": "http",
+                "tag": "ai-socks",
+                "server": "ai.example",
+                "server_port": 443,
+                "tls": {"enabled": True, "server_name": "ai.example", "insecure": True},
+            }
+        ]
+        self.data["route"] = {"final": "ai-socks"}
+        self.save()
+        output = self.invoke(nodes.run, "summary")
+        self.assertIn("ai-socks", output)
+        self.assertIn("tls.insecure", output)
+        self.assertIn("TLS 证书校验已关闭", output)
+
 
 class PackagingTests(unittest.TestCase):
     def setUp(self):
@@ -438,6 +455,9 @@ class PackagingTests(unittest.TestCase):
         )
 
     def test_release_runs_without_source_tree_and_preserves_stdin(self):
+        release = self.release.read_text()
+        self.assertNotIn("python3 -c", release)
+        self.assertIn("python3 /dev/fd/3", release)
         result = self.run_function(
             self.release,
             "python_module firewall ufw_missing 443/tcp 9443/udp",

@@ -87,7 +87,7 @@ def generate():
             {
                 "type": "vless",
                 "tag": "vless-reality",
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["VLESS_PORT"]),
                 "users": [{"name": "main", "uuid": e["UUID"], "flow": "xtls-rprx-vision"}],
                 "tls": {
@@ -110,7 +110,7 @@ def generate():
             {
                 "type": "hysteria2",
                 "tag": "hysteria2",
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["HY2_PORT"]),
                 "bbr_profile": e["HY2_BBR_PROFILE"],
                 "ignore_client_bandwidth": True,
@@ -159,7 +159,7 @@ def generate():
             {
                 "type": "anytls",
                 "tag": "anytls",
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["ANYTLS_PORT"]),
                 "users": [{"name": "main", "password": e["ANYTLS_PASS"]}],
                 "tls": {
@@ -175,7 +175,7 @@ def generate():
             {
                 "type": "tuic",
                 "tag": "tuic",
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["TUIC_PORT"]),
                 "users": [{"name": "main", "uuid": e["TUIC_UUID"], "password": e["TUIC_PASS"]}],
                 "congestion_control": "bbr",

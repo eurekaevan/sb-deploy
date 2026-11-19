@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ['debian:12', 'fedora:43']
+        image: ['debian:12', 'ubuntu:24.04', 'fedora:43']
     container:
       image: ${{ matrix.image }}
     defaults:
@@ -64,5 +64,4 @@ jobs:
       - name: Fast module and packaging tests
         run: python3 -B tests/run_tests.py --group fast
       - name: Isolated system regression tests
-        if: github.event_name != 'pull_request'
         run: python3 -B tests/run_tests.py --group slow

@@ -222,6 +222,27 @@ class HttpsProxyTests(unittest.TestCase):
             network.check_https(outbound)
         self.assertNotEqual(proxy.request, b"")
 
+    def test_https_scan_warns_when_verification_is_disabled(self):
+        with self.proxy() as proxy, tempfile.TemporaryDirectory() as directory:
+            outbound = proxy.outbound()
+            outbound["tag"] = "ai-socks"
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": "wrong.example",
+                "insecure": True,
+            }
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"outbounds": [outbound], "inbounds": []}))
+            errors = io.StringIO()
+            with (
+                patch.object(sys, "argv", ["probe", str(path)]),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors),
+            ):
+                network.connection_probes()
+        self.assertIn("tls.insecure", errors.getvalue())
+        self.assertIn("ai-socks", errors.getvalue())
+
     def test_http_407_reports_status_without_response_or_password(self):
         with self.proxy(response=b"HTTP/1.1 407 echoed-sensitive-response\r\n\r\n") as proxy:
             outbound = proxy.outbound()

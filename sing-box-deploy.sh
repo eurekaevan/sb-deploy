@@ -1262,6 +1262,18 @@ pending_fingerprint() {
   python_module configuration fingerprint "$1"
 }
 
+# The caller runs this in a subshell so the staging paths and its cleanup trap stay local.
+run_staged_command() {
+  local pending="$1"
+  shift
+  LIVE_APP="$APP"
+  APP="$pending" CONFIG="$pending/config.json" STAGING=1
+  TEMP='' TRANSACTION='' ROLLBACK_PATHS=() ROLLBACK_EXISTS=()
+  trap cleanup EXIT
+  "$@"
+  if [[ -f "$APP/hopping.json" ]]; then hopping_runtime validate; fi
+}
+
 stage_changes() {
   need_root
   [[ -f "$CONFIG" ]] || die "配置文件不存在：$CONFIG"
@@ -1282,12 +1294,8 @@ stage_changes() {
   before="$(pending_fingerprint "$pending")"
   ui warning '正在编辑待应用配置；保存不会重载服务、证书、防火墙或跳跃规则。'
   (
-    LIVE_APP="$APP"
-    APP="$pending" CONFIG="$pending/config.json" STAGING=1
-    TEMP='' TRANSACTION='' ROLLBACK_PATHS=() ROLLBACK_EXISTS=()
-    trap cleanup EXIT
-    "$@"
-    if [[ -f "$APP/hopping.json" ]]; then hopping_runtime validate; fi
+    # Keep the staging variables inside this subshell; callers retain live paths.
+    run_staged_command "$pending" "$@"
   )
   if [[ "$(pending_fingerprint "$pending")" == "$before" ]]; then
     if (( ! existed )); then rm -rf -- "$pending"; fi
@@ -1312,7 +1320,7 @@ apply_changes() {
     staged=1
     [[ -f "$pending/base.sha256" ]] || die '待应用配置缺少原配置校验信息，请先丢弃后重新编辑。'
     [[ "$(sha256sum "$CONFIG" | cut -d ' ' -f1)" == "$(cat "$pending/base.sha256")" ]] || die '已应用配置在暂存后被其他操作修改，拒绝覆盖；请先导出并丢弃待应用修改。'
-    (APP="$pending" CONFIG="$pending/config.json" STAGING=1; check_configuration)
+    APP="$pending" CONFIG="$pending/config.json" STAGING=1 check_configuration
   else
     check_configuration
   fi
@@ -1320,7 +1328,7 @@ apply_changes() {
     ui title '确认即将应用的配置文件'
     if (( staged )); then
       printf '%s\n' "$pending/config.json"
-      (APP="$pending" CONFIG="$pending/config.json"; node_config summary)
+      APP="$pending" CONFIG="$pending/config.json" node_config summary
     else
       printf '%s\n' "$CONFIG"
       node_config summary
@@ -1376,7 +1384,7 @@ record_runtime_state() {
 
 show_dashboard() {
   need_root
-  local identity='' snapshot='' version='' pid='' active=0 pending=0 line
+  local identity='' snapshot='' version='' pid='' active=0 pending=0 line pending_app
   if systemctl is-active --quiet "$UNIT"; then active=1; fi
   [[ ! -f "$APP/pending/config.json" ]] || pending=1
   printf '\n'
@@ -1418,23 +1426,25 @@ show_dashboard() {
   if (( pending )); then
     printf '\n'
     ui warning '待应用配置（尚未生效）：'
-    (CONFIG="$APP/pending/config.json"; APP="$APP/pending"; node_config summary) | while IFS= read -r line; do
+    pending_app="$APP/pending"
+    CONFIG="$pending_app/config.json" APP="$pending_app" node_config summary | while IFS= read -r line; do
       ui warning "  · $line"
     done
-    (
-      CONFIG="$APP/pending/config.json"; APP="$APP/pending"
-      ui section '  待应用配置的证书'
-      if ! certificate_status; then ui warning '待应用证书已过期或无法读取，请先修正再应用。'; fi
-    )
+    ui section '  待应用配置的证书'
+    if ! CONFIG="$pending_app/config.json" APP="$pending_app" certificate_status; then
+      ui warning '待应用证书已过期或无法读取，请先修正再应用。'
+    fi
     ui warning '执行 apply 应用并重启；执行 discard-pending 丢弃修改。'
   fi
 }
 
 menu_config() {
-  (
-    if [[ -f "$APP/pending/config.json" ]]; then APP="$APP/pending"; CONFIG="$APP/config.json"; fi
+  if [[ -f "$APP/pending/config.json" ]]; then
+    local pending_app="$APP/pending"
+    APP="$pending_app" CONFIG="$pending_app/config.json" node_config "$@"
+  else
     node_config "$@"
-  )
+  fi
 }
 
 edit_inbound_field() {

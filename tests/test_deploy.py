@@ -606,7 +606,7 @@ check_connections
             with self.subTest(accepted=accepted),socket.socket() as listener:
                 listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
                 errors=[]
-                def serve():
+                def serve(accepted=accepted, errors=errors):
                     try:
                         with listener.accept()[0] as conn:
                             conn.settimeout(5)
@@ -3862,7 +3862,7 @@ firewall_system enable ufw
                     listener.listen()
                     port = listener.getsockname()[1]
                     errors = []
-                    def serve():
+                    def serve(reply=reply, errors=errors):
                         try:
                             with listener.accept()[0] as conn:
                                 conn.settimeout(5)

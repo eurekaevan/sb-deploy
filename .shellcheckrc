@@ -1,2 +1,0 @@
-# Staging intentionally modifies these variables in subshells; callers retain live paths.
-disable=SC2030,SC2031

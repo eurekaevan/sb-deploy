@@ -3,8 +3,11 @@ line-length = 100
 extend-exclude = ["dist"]
 
 [lint]
-select = ["E4", "E9", "F", "I"]
+select = ["E4", "E9", "F", "I", "B", "S"]
 
 [lint.per-file-ignores]
 "scripts/build_release.py" = ["E402"]
-"tests/test_modules.py" = ["E402"]
+# Tests intentionally use asserts, fixed local subprocesses and sample credentials.
+"tests/**" = ["E402", "S101", "S105", "S106", "S603", "S607"]
+# Deployment code invokes fixed system tools with argument lists, never a shell string.
+"lib/sb_deploy/*.py" = ["S603", "S607"]

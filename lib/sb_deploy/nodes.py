@@ -78,10 +78,10 @@ def run():
             return False
         if left.get("listen_port") != right.get("listen_port"):
             return False
-        a, b = left.get("listen", "::"), right.get("listen", "::")
+        a, b = left.get("listen", "::"), right.get("listen", "::")  # noqa: S104 - comparison
         if a == b or "::" in (a, b):
             return True
-        return ("0.0.0.0" in (a, b)) and ":" not in a and ":" not in b
+        return ("0.0.0.0" in (a, b)) and ":" not in a and ":" not in b  # noqa: S104 - wildcard check
 
     def atomic(path, text):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -440,6 +440,18 @@ def run():
                 else str(tag)
             )
             lines.append(f"{label} → {endpoint}")
+        for outbound in c.get("outbounds", []):
+            tls = outbound.get("tls") or {}
+            if (
+                outbound.get("type") == "http"
+                and tls.get("enabled") is True
+                and tls.get("insecure") is True
+            ):
+                lines.append(
+                    "⚠ 警告：HTTPS 出口 "
+                    + json.dumps(outbound.get("tag", "未命名"), ensure_ascii=False)
+                    + " 启用了 tls.insecure，TLS 证书校验已关闭"
+                )
         summary_text = "\n".join(lines)
         if action == "record-runtime":
             atomic(
@@ -535,7 +547,7 @@ def run():
                 unavailable("该入站没有可自动导出的用户，请手动配置客户端。")
             user = users[0]
             server = os.environ.get("SERVER_IP") or item.get("listen", "")
-            if server in ("", "::", "0.0.0.0"):
+            if server in ("", "::", "0.0.0.0"):  # noqa: S104 - wildcard check
                 unavailable("配置仅提供通配监听地址；请用 SERVER_IP=公网地址 导出客户端资料。")
             try:
                 ipaddress.ip_address(server)
@@ -849,7 +861,7 @@ def run():
             if len(sys.argv) > 2 and sys.argv[2].startswith("regenerate-")
             else ""
         )
-        for filename, client, uri, cert, detail in records:
+        for filename, client, _uri, cert, _detail in records:
             if selected and client["type"] != selected:
                 continue
             write_json(client_dir / (filename + ".outbound.json"), client)
@@ -955,7 +967,7 @@ def run():
             a = {
                 "type": "anytls",
                 "tag": new_inbound_tag("anytls"),
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["ANYTLS_PORT"]),
                 "users": [{"name": "main", "password": e["ANYTLS_PASS"]}],
                 "tls": {
@@ -973,7 +985,7 @@ def run():
             u = {
                 "type": "tuic",
                 "tag": new_inbound_tag("tuic"),
-                "listen": "0.0.0.0",
+                "listen": "0.0.0.0",  # noqa: S104 - proxy must accept remote clients
                 "listen_port": int(e["TUIC_PORT"]),
                 "users": [{"name": "main", "uuid": e["TUIC_UUID"], "password": e["TUIC_PASS"]}],
                 "congestion_control": "bbr",

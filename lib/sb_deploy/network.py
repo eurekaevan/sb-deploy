@@ -1,6 +1,25 @@
 """Network validation and configured connection probes."""
 
 
+def https_insecure_warning(outbound: dict):
+    """Return a prominent warning when an HTTPS outbound disables certificate checks."""
+    import json
+
+    tls = outbound.get("tls") or {}
+    if (
+        outbound.get("type") != "http"
+        or tls.get("enabled") is not True
+        or tls.get("insecure") is not True
+    ):
+        return None
+    label = json.dumps(outbound.get("tag", "未命名"), ensure_ascii=False)
+    return (
+        "警告：HTTPS 出口 "
+        + label
+        + " 启用了 tls.insecure，TLS 证书校验已关闭；密码和流量可能被中间人截获。"
+    )
+
+
 def check_socks():
     import os
     import socket
@@ -255,6 +274,9 @@ def connection_probes():
         if outbound.get("type") == "http":
             label = json.dumps(outbound.get("tag", "未命名"), ensure_ascii=False)
             if (outbound.get("tls") or {}).get("enabled"):
+                warning = https_insecure_warning(outbound)
+                if warning:
+                    print("⚠ " + warning, file=sys.stderr)
                 print("检查 HTTPS 出口：" + label, file=sys.stderr)
                 check_https(outbound)
             else:
