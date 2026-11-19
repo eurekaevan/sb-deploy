@@ -21,13 +21,14 @@ def https_insecure_warning(outbound: dict):
 
 
 def check_socks():
-    import os
     import socket
     import struct
     import sys
 
-    prefix = os.environ["SOCKS_PROFILE"].upper() + "_SOCKS"
-    e = os.environ
+    from sb_deploy.context import context
+
+    prefix = context.require("SOCKS_PROFILE").upper() + "_SOCKS"
+    e = context
     user, password = (e[prefix + suffix].encode() for suffix in ("_USER", "_PASS"))
     authenticated = bool(user or password)
     if authenticated and not (1 <= len(user) <= 255 and 1 <= len(password) <= 255):
@@ -206,11 +207,12 @@ def check_https(outbound: dict):
 def check_proxy():
     """Use the protocol chosen for a profile while preserving legacy SOCKS variables."""
     import json
-    import os
     import sys
 
-    profile = os.environ["SOCKS_PROFILE"].upper()
-    protocol = os.environ.get(profile + "_PROXY_PROTOCOL", "socks5")
+    from sb_deploy.context import context
+
+    profile = context.require("SOCKS_PROFILE").upper()
+    protocol = context.get(profile + "_PROXY_PROTOCOL", "socks5")
     if protocol == "socks5":
         check_socks()
         return
@@ -218,26 +220,26 @@ def check_proxy():
         sys.exit("Unsupported proxy protocol; choose socks5 or https.")
     prefix = profile + "_SOCKS"
     try:
-        tls = json.loads(os.environ.get(profile + "_PROXY_TLS") or "{}")
+        tls = json.loads(context.get(profile + "_PROXY_TLS") or "{}")
         if not isinstance(tls, dict):
             raise ValueError("TLS settings must be an object")
         tls = {**tls, "enabled": True}
-        http = json.loads(os.environ.get(profile + "_PROXY_HTTP") or "{}")
+        http = json.loads(context.get(profile + "_PROXY_HTTP") or "{}")
         if not isinstance(http, dict):
             sys.exit("HTTPS proxy HTTP settings must be a JSON object.")
         if set(http) - {"path", "headers", "version"}:
             sys.exit(
                 "Unsupported HTTPS proxy HTTP setting; allowed fields are path, headers and version."
             )
-        name = os.environ.get(profile + "_PROXY_SNI")
+        name = context.get(profile + "_PROXY_SNI")
         if name:
             tls["server_name"] = name
         outbound = {
             "type": "http",
-            "server": os.environ[prefix + "_HOST"],
-            "server_port": int(os.environ[prefix + "_PORT"]),
-            "username": os.environ[prefix + "_USER"],
-            "password": os.environ[prefix + "_PASS"],
+            "server": context.require(prefix + "_HOST"),
+            "server_port": int(context.require(prefix + "_PORT")),
+            "username": context.require(prefix + "_USER"),
+            "password": context.require(prefix + "_PASS"),
             "tls": tls,
             **http,
         }
@@ -248,11 +250,12 @@ def check_proxy():
 
 def public_ipv4():
     import ipaddress
-    import os
     import sys
 
+    from sb_deploy.context import context
+
     try:
-        ip = ipaddress.IPv4Address(os.environ["SERVER_IP"])
+        ip = ipaddress.IPv4Address(context.require("SERVER_IP"))
         if not ip.is_global:
             raise ValueError("not public")
     except Exception as e:

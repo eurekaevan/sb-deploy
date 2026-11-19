@@ -49,6 +49,7 @@ DEFAULT_SOCKS_TFO='true' # Applies to all three proxy outbounds.
 DEFAULT_VLESS_PORT='443'
 DEFAULT_HY2_PORT='443'
 DEFAULT_TUIC_PORT='10443'
+# shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
 DEFAULT_TLS_HANDSHAKE_TIMEOUT='10s'
 DEFAULT_CERT_VALID_DAYS='825'
 DEFAULT_CERT_WARN_DAYS='30'
@@ -70,6 +71,7 @@ DEFAULT_REALITY_FALLBACK_DOMAINS=(
 LOG_LEVEL="${LOG_LEVEL-$DEFAULT_LOG_LEVEL}"
 CERT_VALID_DAYS="${CERT_VALID_DAYS-$DEFAULT_CERT_VALID_DAYS}"
 CERT_WARN_DAYS="${CERT_WARN_DAYS-$DEFAULT_CERT_WARN_DAYS}"
+# shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
 REQUEST_SOCKS_TFO="${SOCKS_TFO-}"
 SOCKS_TFO="${SOCKS_TFO-$DEFAULT_SOCKS_TFO}"
 HY2_BBR_PROFILE_REQUEST="${HY2_BBR_PROFILE-}"
@@ -90,6 +92,21 @@ SERVER_IP="${SERVER_IP-$DEFAULT_SERVER_IP}"
 # An explicit REALITY_DOMAIN pins that target; otherwise installation tries the default and fallbacks.
 REALITY_DOMAIN_REQUEST="${REALITY_DOMAIN-}"
 REALITY_DOMAIN="${REALITY_DOMAIN:-$DEFAULT_REALITY_DOMAIN}"
+
+# Inherited secrets remain usable as shell variables but are not passed to child processes.
+for _secret in \
+  DEFAULT_AI_SOCKS_PASS DEFAULT_GOOGLE_SOCKS_PASS DEFAULT_OTHER_SOCKS_PASS \
+  DEFAULT_AI_SOCKS_USER DEFAULT_GOOGLE_SOCKS_USER DEFAULT_OTHER_SOCKS_USER \
+  AI_SOCKS_PASS GOOGLE_SOCKS_PASS OTHER_SOCKS_PASS \
+  AI_PROXY_PASS GOOGLE_PROXY_PASS OTHER_PROXY_PASS \
+  AI_SOCKS_USER GOOGLE_SOCKS_USER OTHER_SOCKS_USER \
+  AI_PROXY_USER GOOGLE_PROXY_USER OTHER_PROXY_USER \
+  UUID REALITY_PRIVATE SHORT_ID HY2_PASS HY2_OBFS_PASS ANYTLS_PASS TUIC_UUID TUIC_PASS \
+  NEW_UUID NEW_HY2_PASS NEW_HY2_OBFS_PASS NEW_ANYTLS_PASS NEW_TUIC_UUID NEW_TUIC_PASS \
+  FIELD_VALUE PROBE_SOCKS_PASS PROBE_SOCKS_USER; do
+  declare +x "$_secret" 2>/dev/null || true
+done
+unset _secret
 
 # Installation paths and rule sources.
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -125,9 +142,44 @@ OLD_PACKAGE_ID=""
 FW_MARK="sing-box-deploy-$BASHPID"
 FW_SSH_MARK='sing-box-deploy SSH safeguard'
 
+# Versioned shell-to-Python context, written as NUL-delimited key/value pairs on fd 4.
+# Values stay shell variables: they are never exported, placed in argv or mixed with stdin data.
+PYTHON_CONTEXT_VERSION='1'
+python_context_keys() {
+  printf '%s\n' \
+    AI_PROXY_HTTP AI_PROXY_PROTOCOL AI_PROXY_SNI AI_PROXY_TLS \
+    AI_SOCKS_HOST AI_SOCKS_PASS AI_SOCKS_PORT AI_SOCKS_USER \
+    AI_URL ANYTLS_PASS ANYTLS_PORT ANYTLS_SNI APP \
+    BACKUP_DIR BACKUP_KERNEL_VERSION BACKUP_SERVICE_ACTIVE BACKUP_SERVICE_ENABLED \
+    CERT_WARN_DAYS CONFIG DEFAULT_HY2_HOP_INTERVAL DEFAULT_TLS_HANDSHAKE_TIMEOUT \
+    FIELD_VALUE FW_CONFIG_ENDPOINTS FW_MARK FW_NFT FW_PREVIOUS_ENDPOINTS FW_RESTORE FW_SSH_MARK \
+    GOOGLE_PROXY_HTTP GOOGLE_PROXY_PROTOCOL GOOGLE_PROXY_SNI GOOGLE_PROXY_TLS \
+    GOOGLE_SOCKS_HOST GOOGLE_SOCKS_PASS GOOGLE_SOCKS_PORT GOOGLE_SOCKS_USER GOOGLE_URL \
+    HOP_BACKEND HOP_EXCLUDE HOP_INTERVAL HOP_SPEC HOP_UNIT_FILE \
+    HY2_BBR_PROFILE HY2_OBFS_PASS HY2_PASS HY2_PORT HY2_SNI \
+    LIVE_APP LOG_LEVEL MANAGER NO_COLOR \
+    OTHER_PROXY_HTTP OTHER_PROXY_PROTOCOL OTHER_PROXY_SNI OTHER_PROXY_TLS \
+    OTHER_SOCKS_HOST OTHER_SOCKS_PASS OTHER_SOCKS_PORT OTHER_SOCKS_USER \
+    PROBE_SOCKS_HOST PROBE_SOCKS_PASS PROBE_SOCKS_PORT PROBE_SOCKS_USER \
+    REALITY_DOMAIN REALITY_PRIVATE REALITY_PUBLIC REQUEST_SOCKS_TFO SERVER_IP SHORT_ID \
+    SOCKS_PROFILE SOCKS_TFO SSH_CLIENT SSH_CONNECTION SSH_EFFECTIVE_CONFIG SSH_LISTENERS \
+    TEMP TERM TUIC_PASS TUIC_PORT TUIC_SNI TUIC_UUID UUID \
+    VLESS_NETWORK VLESS_PORT YOUTUBE_URL
+}
+python_context() {
+  local key
+  printf 'SBD_CONTEXT\0%s\0' "$PYTHON_CONTEXT_VERSION"
+  while IFS= read -r key; do
+    [[ -v "$key" ]] || continue
+    printf '%s\0%s\0' "$key" "${!key}"
+  done < <(python_context_keys)
+  printf 'READY\0'
+}
+
 # BEGIN PYTHON RUNNER
 python_module() {
-  python3 -B "$PYTHON_ROOT/runner.py" "$@"
+  # Read the context from fd 4 so stdin remains available for callers' data.
+  python3 -B "$PYTHON_ROOT/runner.py" "$@" 4< <(python_context)
 }
 # END PYTHON RUNNER
 
@@ -532,15 +584,23 @@ read_socks_profile() {
     [[ "$user" != *:* ]] || die 'HTTPS Basic 认证用户名不能包含冒号。'
     [[ -z "$sni" || "$sni" =~ ^[a-zA-Z0-9.:-]+$ ]] || die 'HTTPS SNI 必须是域名或 IP 地址。'
   fi
-  export "${prefix}_HOST=$host" "${prefix}_PORT=$((10#$port))" "${prefix}_USER=$user" "${prefix}_PASS=$pass"
-  export "${generic}_PROTOCOL=$protocol" "${generic}_SNI=${sni:-$host}" "${generic}_TLS=$tls" "${generic}_HTTP=$http"
+  printf -v "${prefix}_HOST" '%s' "$host"
+  printf -v "${prefix}_PORT" '%s' "$((10#$port))"
+  printf -v "${prefix}_USER" '%s' "$user"
+  printf -v "${prefix}_PASS" '%s' "$pass"
+  printf -v "${generic}_PROTOCOL" '%s' "$protocol"
+  printf -v "${generic}_SNI" '%s' "${sni:-$host}"
+  printf -v "${generic}_TLS" '%s' "$tls"
+  printf -v "${generic}_HTTP" '%s' "$http"
 }
 
 # Check proxy authentication and CONNECT without placing credentials in argv/logs.
 check_socks() {
   local key="${1^^}_PROXY_PROTOCOL"
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
+  local SOCKS_PROFILE="$1"
   log "Checking $1 ${!key:-socks5} authentication and outbound connectivity"
-  SOCKS_PROFILE="$1" python_module network check_proxy
+  python_module network check_proxy
 }
 
 forget_socks() {
@@ -551,9 +611,12 @@ forget_socks() {
 }
 
 public_ipv4_candidate_is_global() {
-  local candidate="$1"
+  local candidate="$1" previous="${SERVER_IP-}" result
   [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
-  SERVER_IP="$candidate" python_module network public_ipv4 >/dev/null 2>&1
+  SERVER_IP="$candidate"
+  if python_module network public_ipv4 >/dev/null 2>&1; then result=0; else result=1; fi
+  SERVER_IP="$previous"
+  return "$result"
 }
 
 # Try the local egress address first, then independent HTTPS echo services.
@@ -585,12 +648,10 @@ detect_public_ipv4() {
 public_ipv4() {
   SERVER_IP="${SERVER_IP:-}"
   if [[ -n "$SERVER_IP" ]]; then
-    export SERVER_IP
     python_module network public_ipv4
   else
     SERVER_IP="$(detect_public_ipv4)" || SERVER_IP=''
     [[ -n "$SERVER_IP" ]] || die 'Cannot detect a public IPv4 from the local route or the configured HTTP sources; set SERVER_IP=<your server public IP> and retry.'
-    export SERVER_IP
   fi
   log "Detected public IPv4: $SERVER_IP"
 }
@@ -620,7 +681,6 @@ check_reality_target() {
     log "Testing third-party Reality handshake target ${domain}:443 (TLS 1.3 + h2)"
     if reality_target_supported "$domain"; then
       REALITY_DOMAIN="$domain"
-      export REALITY_DOMAIN
       log "Reality handshake target verified: ${domain}:443"
       return 0
     fi
@@ -656,27 +716,23 @@ new_credentials() {
     REALITY_PRIVATE="$(sed -n 's/^PrivateKey: *//p' <<< "$kp" | head -n 1)"
     REALITY_PUBLIC="$(sed -n 's/^PublicKey: *//p' <<< "$kp" | head -n 1)"
     [[ -n "$REALITY_PRIVATE" && -n "$REALITY_PUBLIC" ]] || die 'Failed to parse sing-box reality-keypair output.'
+    # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
     SHORT_ID="$(openssl rand -hex 8)"
-    export UUID REALITY_PRIVATE REALITY_PUBLIC SHORT_ID
   fi
   if [[ "$protocol" == all || "$protocol" == hysteria2 ]]; then
     HY2_PASS="$(openssl rand -hex 24)"
     HY2_OBFS_PASS="$(openssl rand -hex 24)"
-    export HY2_PASS HY2_OBFS_PASS
   fi
   if [[ "$protocol" == all || "$protocol" == anytls ]]; then
     ANYTLS_PASS="$(openssl rand -base64 32)"
-    export ANYTLS_PASS
   fi
   if [[ "$protocol" == all || "$protocol" == tuic ]]; then
     TUIC_UUID="$(cat /proc/sys/kernel/random/uuid)"
     TUIC_PASS="$(openssl rand -base64 32)"
-    export TUIC_UUID TUIC_PASS
   fi
 }
 
 certificate_status() {
-  export CONFIG CERT_WARN_DAYS
   local index result=0 level
   local -a records=()
   mapfile -d '' -t records < <(python_module certificates status)
@@ -732,7 +788,6 @@ renew_certificates() {
 }
 
 write_jsons() {
-  export APP CONFIG REALITY_DOMAIN LOG_LEVEL AI_URL GOOGLE_URL YOUTUBE_URL VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS HY2_BBR_PROFILE SOCKS_TFO TUIC_PORT TUIC_UUID TUIC_PASS TUIC_SNI DEFAULT_TLS_HANDSHAKE_TIMEOUT
   python_module configuration generate
   check_configuration || die 'sing-box check failed. Service was not started.'
   node_config export
@@ -903,7 +958,7 @@ rollback_firewall() {
   local index entry backend mode zone port proto rules handles family table chain handle rc failed=0
   if (( FW_NFT )); then
     if rules="$(nft -j list ruleset)"; then
-      if handles="$(FW_MARK="$FW_MARK" python_module firewall nft_handles <<< "$rules")"; then
+      if handles="$(python_module firewall nft_handles <<< "$rules")"; then
         while read -r family table chain handle; do
           [[ -n "$handle" ]] || continue
           nft delete rule "$family" "$table" "$chain" handle "$handle" || failed=1
@@ -987,7 +1042,9 @@ ssh_listening_ports() {
       effective=''
     fi
   fi
-  SSH_LISTENERS="$sockets" SSH_EFFECTIVE_CONFIG="$effective" python_module firewall ssh_listeners
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
+  local SSH_LISTENERS="$sockets" SSH_EFFECTIVE_CONFIG="$effective"
+  python_module firewall ssh_listeners
 }
 
 # SSH permits are deliberately not node-owned rules: uninstall/port edits must retain them.
@@ -1192,7 +1249,6 @@ fresh_install() {
   make_tls_certificate anytls "$ANYTLS_SNI"
   TUIC_SNI="$REALITY_DOMAIN"
   make_tls_certificate tuic "$TUIC_SNI"
-  export AI_URL GOOGLE_URL YOUTUBE_URL
   write_jsons
   install_manager
   if [[ -f "$TEMP/hopping-plan.json" ]]; then
@@ -1224,7 +1280,6 @@ set_socks_profile() {
   done
   check_configuration
   begin_transaction update "$CONFIG" "$APP/client"
-  export CONFIG APP SOCKS_TFO REQUEST_SOCKS_TFO
   python_module configuration set_socks "$@"
   forget_socks
   check_configuration
@@ -1262,10 +1317,25 @@ pending_fingerprint() {
   python_module configuration fingerprint "$1"
 }
 
+# Run a command with staging paths in scope while keeping them out of the child environment.
+with_app_config() {
+  # shellcheck disable=SC2034 # Read by the invoked command through the versioned context.
+  local APP="$1" CONFIG="$2"
+  shift 2
+  "$@"
+}
+with_staged_app() {
+  # shellcheck disable=SC2034 # Read by the invoked command through the versioned context.
+  local APP="$1" CONFIG="$2" STAGING=1
+  shift 2
+  "$@"
+}
+
 # The caller runs this in a subshell so the staging paths and its cleanup trap stay local.
 run_staged_command() {
   local pending="$1"
   shift
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
   LIVE_APP="$APP"
   APP="$pending" CONFIG="$pending/config.json" STAGING=1
   TEMP='' TRANSACTION='' ROLLBACK_PATHS=() ROLLBACK_EXISTS=()
@@ -1320,7 +1390,7 @@ apply_changes() {
     staged=1
     [[ -f "$pending/base.sha256" ]] || die '待应用配置缺少原配置校验信息，请先丢弃后重新编辑。'
     [[ "$(sha256sum "$CONFIG" | cut -d ' ' -f1)" == "$(cat "$pending/base.sha256")" ]] || die '已应用配置在暂存后被其他操作修改，拒绝覆盖；请先导出并丢弃待应用修改。'
-    APP="$pending" CONFIG="$pending/config.json" STAGING=1 check_configuration
+    with_staged_app "$pending" "$pending/config.json" check_configuration
   else
     check_configuration
   fi
@@ -1328,7 +1398,7 @@ apply_changes() {
     ui title '确认即将应用的配置文件'
     if (( staged )); then
       printf '%s\n' "$pending/config.json"
-      APP="$pending" CONFIG="$pending/config.json" node_config summary
+      with_app_config "$pending" "$pending/config.json" node_config summary
     else
       printf '%s\n' "$CONFIG"
       node_config summary
@@ -1427,11 +1497,11 @@ show_dashboard() {
     printf '\n'
     ui warning '待应用配置（尚未生效）：'
     pending_app="$APP/pending"
-    CONFIG="$pending_app/config.json" APP="$pending_app" node_config summary | while IFS= read -r line; do
+    with_app_config "$pending_app" "$pending_app/config.json" node_config summary | while IFS= read -r line; do
       ui warning "  · $line"
     done
     ui section '  待应用配置的证书'
-    if ! CONFIG="$pending_app/config.json" APP="$pending_app" certificate_status; then
+    if ! with_app_config "$pending_app" "$pending_app/config.json" certificate_status; then
       ui warning '待应用证书已过期或无法读取，请先修正再应用。'
     fi
     ui warning '执行 apply 应用并重启；执行 discard-pending 丢弃修改。'
@@ -1441,14 +1511,14 @@ show_dashboard() {
 menu_config() {
   if [[ -f "$APP/pending/config.json" ]]; then
     local pending_app="$APP/pending"
-    APP="$pending_app" CONFIG="$pending_app/config.json" node_config "$@"
+    with_app_config "$pending_app" "$pending_app/config.json" node_config "$@"
   else
     node_config "$@"
   fi
 }
 
 edit_inbound_field() {
-  local selected="$1" pointer="$2" value="${3-}" input
+  local selected="$1" pointer="$2" value="${3-}" input FIELD_VALUE
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
   node_config extract-inbound "$selected" > "$TEMP/field-original.json"
   if (( $# < 3 )); then
@@ -1460,7 +1530,9 @@ edit_inbound_field() {
     [[ "$value" != :cancel ]] || return 0
   fi
   input="$TEMP/field-edited.json"
-  FIELD_VALUE="$value" python_module configuration edit_field "$TEMP/field-original.json" "$input" "$pointer"
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
+  FIELD_VALUE="$value"
+  python_module configuration edit_field "$TEMP/field-original.json" "$input" "$pointer"
   edit_protocol "$selected" "$input"
 }
 
@@ -1529,7 +1601,7 @@ update_log_level() {
 }
 
 export_client_files() {
-  local rc report
+  local rc report CLIENT_EXPORT_OPTIONAL=1
   CLIENT_EXPORT_FAILED=0
   [[ -n "$TEMP" ]] || TEMP="$(mktemp -d)"
   report="$TEMP/client-export-error"
@@ -1538,10 +1610,11 @@ export_client_files() {
     warn '无法创建可选的客户端导出目录；配置保存不受影响，请手动导出。'
     return 0
   fi
-  if CLIENT_EXPORT_OPTIONAL=1 node_config export "${1:-}" 2>"$report"; then
+  if node_config export "${1:-}" 2>"$report"; then
     if ! rm -f "$APP/client/EXPORT-ERROR.txt"; then warn '旧的导出错误记录未能删除；请查看目录权限。'; fi
     return 0
   else rc=$?; fi
+  CLIENT_EXPORT_OPTIONAL=0
   CLIENT_EXPORT_FAILED=1
   cat "$report" >&2
   if ! install -m 0600 "$report" "$APP/client/EXPORT-ERROR.txt"; then
@@ -1567,7 +1640,6 @@ node_config() {
         fi
       fi ;;
   esac
-  export APP CONFIG DEFAULT_HY2_HOP_INTERVAL DEFAULT_TLS_HANDSHAKE_TIMEOUT LIVE_APP SERVER_IP
   python_module nodes run "$@"
 }
 
@@ -1578,7 +1650,6 @@ load_node_settings() {
   [[ ${#settings[@]} == 37 && "${settings[36]}" == READY ]] || die '无法读取已有节点配置。'
   for ((index=0; index<36; index+=2)); do
     printf -v "${settings[index]}" '%s' "${settings[index+1]}"
-    export "${settings[index]}"
   done
 }
 
@@ -1737,7 +1808,6 @@ set_node() {
       fi ;;
     *) die '未知节点修改操作。' ;;
   esac
-  export VLESS_PORT HY2_PORT ANYTLS_PORT ANYTLS_SNI ANYTLS_PASS REALITY_DOMAIN HY2_SNI UUID HY2_PASS HY2_OBFS_PASS HY2_BBR_PROFILE SOCKS_TFO TUIC_PORT TUIC_SNI TUIC_UUID TUIC_PASS
   local validation
   validation="$(node_config validate "$mode")"
   if [[ "$validation" == unchanged ]]; then log '设置没有变化，已保留现有配置。'; return 0; fi
@@ -1796,10 +1866,9 @@ update_firewall_ownership() {
   FW_RESTORE="$TEMP/firewall-restore.json"
   FW_CONFIG_ENDPOINTS=''
   if [[ "${1:-}" != restore && "${1:-}" != remove-all && -f "$CONFIG" ]]; then
+    # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
     FW_CONFIG_ENDPOINTS="$(configuration_listeners)"
   fi
-  export FW_CONFIG_ENDPOINTS FW_PREVIOUS_ENDPOINTS="${FW_PREVIOUS_ENDPOINTS-}"
-  export APP TEMP FW_MARK FW_SSH_MARK FW_NFT FW_RESTORE VLESS_PORT HY2_PORT ANYTLS_PORT TUIC_PORT VLESS_NETWORK
   python_module firewall ownership "$@"
 }
 
@@ -1955,7 +2024,7 @@ check_connections() {
   printf '\n' >&2
   ui title '  ╭─ 连接检查 ────────────────────────────────' >&2
   "$BIN" check -c "$CONFIG"
-  local index
+  local index PROBE_SOCKS_HOST PROBE_SOCKS_PORT PROBE_SOCKS_USER PROBE_SOCKS_PASS
   local -a probes=()
   mapfile -d '' -t probes < <(python_module network connection_probes "$CONFIG")
   (( ${#probes[@]} >= 1 && (${#probes[@]}-1)%5 == 0 )) && [[ "${probes[-1]}" == READY ]] || die '无法完成当前配置的连接检查。'
@@ -1964,9 +2033,15 @@ check_connections() {
   fi
   for ((index=0; index<${#probes[@]}-1; index+=5)); do
     log "检查 SOCKS5 出口：${probes[index]}"
-    export PROBE_SOCKS_HOST="${probes[index+1]}" PROBE_SOCKS_PORT="${probes[index+2]}" PROBE_SOCKS_USER="${probes[index+3]}" PROBE_SOCKS_PASS="${probes[index+4]}"
+    # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
+    PROBE_SOCKS_HOST="${probes[index+1]}"
+    # shellcheck disable=SC2034
+    PROBE_SOCKS_PORT="${probes[index+2]}"
+    # shellcheck disable=SC2034
+    PROBE_SOCKS_USER="${probes[index+3]}"
+    # shellcheck disable=SC2034
+    PROBE_SOCKS_PASS="${probes[index+4]}"
     check_socks probe
-    unset PROBE_SOCKS_HOST PROBE_SOCKS_PORT PROBE_SOCKS_USER PROBE_SOCKS_PASS
   done
   log '当前配置、已配置 SOCKS5 / HTTPS 及可检查的 TLS 项目检查通过；公网节点连通性仍需客户端验证。'
   ui success '  ╰─ 检查完成，未发现异常。' >&2
@@ -2179,7 +2254,9 @@ prepare_hopping() {
     else dnf install -y nftables; fi
     backend=nft
   fi
-  HOP_SPEC="$spec" HOP_EXCLUDE="$exclusion" HOP_INTERVAL="$interval" HOP_BACKEND="$backend" HY2_PORT="$HY2_PORT" python_module hopping prepare "$TEMP"
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
+  local HOP_SPEC="$spec" HOP_EXCLUDE="$exclusion" HOP_INTERVAL="$interval" HOP_BACKEND="$backend"
+  python_module hopping prepare "$TEMP"
 }
 
 snapshot_hopping() {
@@ -2369,7 +2446,6 @@ kernel_update() {
 }
 
 backup_archive() {
-  export APP CONFIG BACKUP_DIR MANAGER HOP_UNIT_FILE
   python_module backup archive "$@"
 }
 backup_cmd() {
@@ -2380,13 +2456,15 @@ backup_cmd() {
   if [[ -x "$BIN" ]] && version="$("$BIN" version 2>/dev/null)" && [[ -n "$version" ]]; then
     BACKUP_KERNEL_VERSION="${version%%$'\n'*}"
   else
+    # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
     BACKUP_KERNEL_VERSION=unknown
     log '无法读取内核版本，将继续备份配置资料。'
   fi
   BACKUP_SERVICE_ACTIVE=no; BACKUP_SERVICE_ENABLED=no
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
   if systemctl is-active --quiet "$UNIT"; then BACKUP_SERVICE_ACTIVE=yes; fi
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
   if systemctl is-enabled --quiet "$UNIT"; then BACKUP_SERVICE_ENABLED=yes; fi
-  export BACKUP_KERNEL_VERSION BACKUP_SERVICE_ACTIVE BACKUP_SERVICE_ENABLED
   LAST_BACKUP="$(backup_archive create "$target")"
   success "备份完成：$LAST_BACKUP（包含节点密码和私钥，请妥善保管）。"
 }
@@ -2396,6 +2474,7 @@ restore_backup() {
   show_occupied_ports
   require_no_pending
   [[ -x "$BIN" ]] || die '请先安装兼容的 sing-box 内核，再恢复配置。'
+  # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
   local FW_PREVIOUS_ENDPOINTS=''
   local source="${1:-${BACKUP_FILE:-}}" answer
   if [[ -z "$source" && -t 0 ]]; then
@@ -2412,6 +2491,7 @@ restore_backup() {
   fi
   if [[ -f "$CONFIG" ]]; then
     if ! FW_PREVIOUS_ENDPOINTS="$(configuration_listeners)"; then
+      # shellcheck disable=SC2034 # Sent to Python through the versioned context stream.
       FW_PREVIOUS_ENDPOINTS=''
       log '当前配置已损坏，旧防火墙规则将保留。'
     fi

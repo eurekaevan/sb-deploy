@@ -23,8 +23,10 @@ def run():
     import tempfile
     import uuid
 
-    p = pathlib.Path(os.environ["CONFIG"])
-    app = pathlib.Path(os.environ["APP"])
+    from sb_deploy.context import context
+
+    p = pathlib.Path(context.require("CONFIG"))
+    app = pathlib.Path(context.require("APP"))
     action = sys.argv[1]
     if action == "running-summary":
         state_path = app / "runtime-state.json"
@@ -108,7 +110,7 @@ def run():
 
     if action == "log-level":
         levels = ("trace", "debug", "info", "warn", "error", "fatal", "panic")
-        level = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("LOG_LEVEL", "warn")
+        level = sys.argv[2] if len(sys.argv) > 2 else context.get("LOG_LEVEL", "warn")
         if level not in levels:
             sys.exit("日志级别必须是 trace、debug、info、warn、error、fatal 或 panic。")
         if (c.get("log") or {}).get("level") == level:
@@ -244,7 +246,7 @@ def run():
         candidate = json.loads(pathlib.Path(sys.argv[3]).read_text())
         if not isinstance(candidate, dict) or candidate.get("type") != old.get("type"):
             sys.exit("请保留协议类型；新增其他协议请使用生成协议菜单。")
-        live = pathlib.Path(os.environ.get("LIVE_APP") or str(app))
+        live = pathlib.Path(context.get("LIVE_APP") or str(app))
         for key in ("certificate_path", "key_path"):
             tls = candidate.get("tls") or {}
             if key not in tls:
@@ -337,7 +339,7 @@ def run():
             if item.get("type") not in ("vless", "hysteria2", "anytls", "tuic"):
                 continue
             if isinstance(item.get("tls"), dict):
-                item["tls"]["handshake_timeout"] = os.environ["DEFAULT_TLS_HANDSHAKE_TIMEOUT"]
+                item["tls"]["handshake_timeout"] = context.require("DEFAULT_TLS_HANDSHAKE_TIMEOUT")
             if item["type"] == "hysteria2":
                 item.update(ignore_client_bandwidth=True, bbr_profile="standard")
                 for field in optional_quic:
@@ -546,7 +548,7 @@ def run():
             if not users:
                 unavailable("该入站没有可自动导出的用户，请手动配置客户端。")
             user = users[0]
-            server = os.environ.get("SERVER_IP") or item.get("listen", "")
+            server = context.get("SERVER_IP") or item.get("listen", "")
             if server in ("", "::", "0.0.0.0"):  # noqa: S104 - wildcard check
                 unavailable("配置仅提供通配监听地址；请用 SERVER_IP=公网地址 导出客户端资料。")
             try:
@@ -572,7 +574,9 @@ def run():
             ):
                 if key in tls:
                     client_tls[key] = copy.deepcopy(tls[key])
-            client_tls.setdefault("handshake_timeout", os.environ["DEFAULT_TLS_HANDSHAKE_TIMEOUT"])
+            client_tls.setdefault(
+                "handshake_timeout", context.require("DEFAULT_TLS_HANDSHAKE_TIMEOUT")
+            )
             client["tls"] = client_tls
             proxy = {"name": label, "type": kind, "server": server, "port": item["listen_port"]}
             cert = ""
@@ -833,8 +837,8 @@ def run():
         if action == "show":
             colorful = (
                 sys.stdout.isatty()
-                and os.environ.get("TERM", "dumb") != "dumb"
-                and "NO_COLOR" not in os.environ
+                and context.get("TERM", "dumb") != "dumb"
+                and "NO_COLOR" not in context
             )
             in_yaml = False
             for line in summary.splitlines():
@@ -928,7 +932,9 @@ def run():
             "HY2_PASS": user(h, "password"),
             "HY2_OBFS_PASS": (h.get("obfs") or {}).get("password", ""),
             "HY2_HOP_PORTS": ",".join(hop.get("ports", [])) if hop.get("enabled") else "",
-            "HY2_HOP_INTERVAL": hop.get("hop_interval", os.environ["DEFAULT_HY2_HOP_INTERVAL"]),
+            "HY2_HOP_INTERVAL": hop.get(
+                "hop_interval", context.require("DEFAULT_HY2_HOP_INTERVAL")
+            ),
         }
         for key, value in values.items():
             sys.stdout.write(key + "\0" + str(value) + "\0")
@@ -954,7 +960,7 @@ def run():
             sys.exit("配置中的协议端口无效。")
     if action in ("update", "validate"):
         mode = sys.argv[2]
-        e = os.environ
+        e = context
         if mode in ("ports", "sni", "credentials", "rotate") and (not v or not h):
             sys.exit("此批量快捷操作需要 VLESS 和 HY2；请通过协议子菜单逐项修改已有入站。")
         if mode in ("regenerate-vless", "regenerate-hysteria2", "bbr") and not (

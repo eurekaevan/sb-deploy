@@ -23,10 +23,19 @@ def bundle_script(source: str, modules: Path) -> str:
     payload = base64.b85encode(zlib.compress(json.dumps(sources).encode(), 9)).decode()
     bootstrap = f"""import base64, json, sys, types, zlib
 sources = json.loads(zlib.decompress(base64.b85decode({payload!r})))
+package = types.ModuleType("sb_deploy")
+package.__path__ = []
+sys.modules["sb_deploy"] = package
+context_module = types.ModuleType("sb_deploy.context")
+exec(compile(sources["context"], "context.py", "exec"), context_module.__dict__)
+sys.modules["sb_deploy.context"] = context_module
+package.context = context_module
+context_module.load()
 name, action = sys.argv[1:3]
 sys.argv = [name, *sys.argv[3:]]
 module = types.ModuleType("sb_deploy." + name)
 exec(compile(sources[name], name + ".py", "exec"), module.__dict__)
+setattr(package, name, module)
 getattr(module, action)()
 """
     delimiter = "SB_PYTHON_BUNDLE_END"
@@ -36,8 +45,8 @@ getattr(module, action)()
         START
         + PACKED
         + "\npython_module() {\n"
-        + "  # Read the module from fd 3 so callers can keep using stdin for data.\n"
-        + f"  python3 /dev/fd/3 \"$@\" 3<<'{delimiter}'\n"
+        + "  # The module travels on fd 3 and operation context on fd 4; stdin stays free.\n"
+        + f"  python3 /dev/fd/3 \"$@\" 4< <(python_context) 3<<'{delimiter}'\n"
         + bootstrap
         + delimiter
         + "\n}\n"

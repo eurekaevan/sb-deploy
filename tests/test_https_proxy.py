@@ -17,6 +17,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+from sb_deploy import context as sb_context
+
 spec = importlib.util.spec_from_file_location("https_network", ROOT / "lib/sb_deploy/network.py")
 network = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(network)
@@ -303,7 +306,7 @@ class HttpsProxyTests(unittest.TestCase):
                     {"certificate_path": str(self.certificate), "min_version": "1.2"}
                 ),
             }
-            with patch.dict(os.environ, env):
+            with sb_context.temporary(env):
                 network.check_proxy()
         self.assertEqual(proxy.sni, "proxy.example")
 
@@ -320,7 +323,7 @@ class HttpsProxyTests(unittest.TestCase):
         for settings in ({"headers": {"X-Example": "private"}}, {"path": "/proxy"}, {"version": 2}):
             with (
                 self.subTest(settings=settings),
-                patch.dict(os.environ, {**env, "AI_PROXY_HTTP": json.dumps(settings)}),
+                sb_context.temporary({**env, "AI_PROXY_HTTP": json.dumps(settings)}),
                 patch("socket.create_connection") as connect,
             ):
                 with self.assertRaisesRegex(SystemExit, "CONNECT path|HTTP/1.1 CONNECT") as failure:
@@ -333,7 +336,7 @@ class HttpsProxyTests(unittest.TestCase):
         for settings in ("[]", '"text"', '{"server": "private"}', "invalid"):
             with (
                 self.subTest(settings=settings),
-                patch.dict(os.environ, {**env, "AI_PROXY_HTTP": settings}),
+                sb_context.temporary({**env, "AI_PROXY_HTTP": settings}),
                 patch("socket.create_connection") as connect,
             ):
                 with self.assertRaisesRegex(SystemExit, "HTTP setting|HTTP settings") as failure:
@@ -394,7 +397,7 @@ class HttpsProxyTests(unittest.TestCase):
         self.assertNotIn("READY", output.getvalue())
 
     def test_invalid_profile_and_partial_auth_are_rejected_safely(self):
-        with patch.dict(os.environ, {"SOCKS_PROFILE": "ai", "AI_PROXY_PROTOCOL": "invalid"}):
+        with sb_context.temporary({"SOCKS_PROFILE": "ai", "AI_PROXY_PROTOCOL": "invalid"}):
             with self.assertRaisesRegex(SystemExit, "Unsupported proxy protocol"):
                 network.check_proxy()
         outbound = {

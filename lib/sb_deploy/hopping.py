@@ -19,13 +19,14 @@ def enabled():
 
 def prepare():
     import json
-    import os
     import pathlib
     import re
     import sys
 
+    from sb_deploy.context import context
+
     root = pathlib.Path(sys.argv[1])
-    e = os.environ
+    e = context
 
     def ports(spec):
         result = set()

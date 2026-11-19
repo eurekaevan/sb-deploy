@@ -238,20 +238,27 @@ set_socks_profile ai google
         source = source.replace("DEFAULT_SERVER_IP=''", "DEFAULT_SERVER_IP='8.8.8.8'")
         self.lib.write_text(source)
         body = '''read_socks_profile other
-python3 - <<'PYOUT'
-import json, os
-print(json.dumps([os.environ['OTHER_SOCKS_'+k] for k in ('HOST','PORT','USER','PASS')]))
+python3 - 4< <(python_context) <<'PYOUT'
+import json, os, sys
+raw = os.read(4, 1 << 20)
+fields = raw.rstrip(b"\\0").split(b"\\0")
+assert fields[0] == b"SBD_CONTEXT" and fields[1] == b"1" and fields[-1] == b"READY"
+values = {key.decode(): value.decode() for key, value in zip(fields[2:-1:2], fields[3:-1:2])}
+print(json.dumps([values["OTHER_SOCKS_" + k] for k in ("HOST", "PORT", "USER", "PASS")]))
+print(json.dumps([os.environ.get("OTHER_SOCKS_" + k) for k in ("USER", "PASS")]))
 PYOUT
 printf '%s' "$SERVER_IP"
 '''
         result = self.run_bash(body)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout.splitlines()[0]), ['source.example','1080','source-user','source-pass'])
+        self.assertEqual(json.loads(result.stdout.splitlines()[1]), [None, None])
         self.assertTrue(result.stdout.endswith('8.8.8.8'))
         result = self.run_bash(body, OTHER_SOCKS_HOST='env.example', OTHER_SOCKS_PORT='01081',
                                OTHER_SOCKS_USER='env-user', OTHER_SOCKS_PASS='env-pass', SERVER_IP='1.1.1.1')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout.splitlines()[0]), ['env.example','1081','env-user','env-pass'])
+        self.assertEqual(json.loads(result.stdout.splitlines()[1]), [None, None])
         self.assertTrue(result.stdout.endswith('1.1.1.1'))
         self.assertNotIn('source-pass', result.stderr)
         self.assertNotIn('env-pass', result.stderr)
@@ -581,18 +588,14 @@ show_node_details
             {'type':'socks','tag':'old-socks4','server':'v4.example','server_port':19003,'version':'4'}]}
         self.config.write_text(json.dumps(config))
         result=self.run_bash('''check_socks() {
-  python3 - <<'PYCODE'
-import json,os,pathlib
-p=pathlib.Path(os.environ['TEST_ROOT'])/'probes.jsonl'
-with p.open('a') as f: f.write(json.dumps([os.environ['PROBE_SOCKS_'+k] for k in ('HOST','PORT','USER','PASS')])+'\\n')
-PYCODE
+  printf '%s|%s|%s|%s\\n' "$PROBE_SOCKS_HOST" "$PROBE_SOCKS_PORT" "$PROBE_SOCKS_USER" "$PROBE_SOCKS_PASS" >> "$TEST_ROOT/probes.txt"
 }
 load_node_settings() { die 'managed settings must not be read'; }
 check_reality_target() { die 'fixed Reality target must not be read'; }
 check_connections
 ''',AI_SOCKS_HOST='wrong.example',AI_SOCKS_PORT='1080',AI_SOCKS_USER='wrong',AI_SOCKS_PASS='wrong')
         self.assertEqual(result.returncode,0,result.stderr)
-        rows=[json.loads(line) for line in (self.root/'probes.jsonl').read_text().splitlines()]
+        rows=[line.split('|') for line in (self.root/'probes.txt').read_text().splitlines()]
         self.assertEqual(rows,[['auth.example','19001','actual-user','actual-secret'],['open.example','19002','','']])
         self.assertIn('custom-auth',result.stderr)
         self.assertIn('custom-open',result.stderr)
@@ -2474,7 +2477,7 @@ echo HTTPS_INPUT_OK
     def test_installed_values_win_over_source_defaults_on_enter(self):
         self.managed_node()
         before=self.config.read_bytes()
-        result=self.run_terminal('read_socks_profile ai\npython3 - <<\'PYASSERT\'\nimport os\nassert os.environ["AI_SOCKS_HOST"]=="old-ai"\nassert os.environ["AI_SOCKS_PASS"]=="ai-secret"\nprint("CURRENT_VALUES_OK")\nPYASSERT\n','\n\n\n\n\n')
+        result=self.run_terminal('read_socks_profile ai\n[[ "$AI_SOCKS_HOST" == old-ai && "$AI_SOCKS_PASS" == ai-secret ]]\npython3 - <<\'PYASSERT\'\nimport os\nassert "AI_SOCKS_PASS" not in os.environ and "AI_SOCKS_USER" not in os.environ\nprint("CURRENT_VALUES_OK")\nPYASSERT\n','\n\n\n\n\n')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('CURRENT_VALUES_OK',result.stdout)
         self.assertNotIn('ai-secret',result.stdout)

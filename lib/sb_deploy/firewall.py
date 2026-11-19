@@ -120,14 +120,15 @@ def status():
 
 
 def ssh_listeners():
-    import os
     import re
     import sys
+
+    from sb_deploy.context import context
 
     listeners = {}
     ssh = set()
     systemd = set()
-    for line in os.environ["SSH_LISTENERS"].splitlines():
+    for line in context.require("SSH_LISTENERS").splitlines():
         fields = line.split()
         if fields and fields[0] in ("tcp", "tcp6"):
             fields = fields[1:]
@@ -146,7 +147,7 @@ def ssh_listeners():
         if re.search(r'\("systemd"[,)]', line):
             systemd.add(entry)
     configured = set()
-    for line in os.environ["SSH_EFFECTIVE_CONFIG"].splitlines():
+    for line in context.require("SSH_EFFECTIVE_CONFIG").splitlines():
         fields = line.split()
         if len(fields) != 2:
             continue
@@ -158,8 +159,8 @@ def ssh_listeners():
                 configured.add(int(match[1]))
     # Cover socket-activated sshd without trusting an unbound or stale config port.
     ssh.update(entry for entry in systemd if entry[1] in configured)
-    connection = os.environ.get("SSH_CONNECTION", "")
-    client = os.environ.get("SSH_CLIENT", "")
+    connection = context.get("SSH_CONNECTION", "")
+    client = context.get("SSH_CLIENT", "")
     if connection or client:
         fields = (connection or client).split()
         expected = 4 if connection else 3
@@ -283,9 +284,11 @@ def ownership():
     import sys
     import tempfile
 
-    app = pathlib.Path(os.environ["APP"])
+    from sb_deploy.context import context
+
+    app = pathlib.Path(context.require("APP"))
     ledger = app / "firewall-owned.json"
-    restore = pathlib.Path(os.environ["FW_RESTORE"])
+    restore = pathlib.Path(context.require("FW_RESTORE"))
     mode = sys.argv[1] if len(sys.argv) > 1 else "save"
 
     def run(args, query=False):
@@ -420,8 +423,8 @@ def ownership():
 
     old = json.loads(ledger.read_text()) if ledger.exists() else []
     new = []
-    marker = os.environ["FW_MARK"]
-    journal = pathlib.Path(os.environ["TEMP"]) / "firewall.undo"
+    marker = context.require("FW_MARK")
+    journal = pathlib.Path(context.require("TEMP")) / "firewall.undo"
     if journal.exists():
         for line in journal.read_text().splitlines():
             args = line.split()
@@ -435,7 +438,7 @@ def ownership():
                 proto, port = args[1:]
             record.update(proto=proto, port=int(port))
             new.append(record)
-    if os.environ["FW_NFT"] == "1":
+    if context.require("FW_NFT") == "1":
         rules = json.loads(run(["nft", "-j", "list", "ruleset"]).stdout)["nftables"]
         for item in rules:
             r = item.get("rule", {})
@@ -465,24 +468,24 @@ def ownership():
                 sys.exit("无法识别本次新增的 nftables 端口规则。")
     retired = set()
     legacy = len(sys.argv) in (3, 4, 5, 6)
-    if legacy or os.environ.get("FW_PREVIOUS_ENDPOINTS"):
+    if legacy or context.get("FW_PREVIOUS_ENDPOINTS"):
         current = set()
         previous = set()
-        if os.environ.get("FW_CONFIG_ENDPOINTS"):
+        if context.get("FW_CONFIG_ENDPOINTS"):
             current = {
                 (parts[0], int(parts[1]))
-                for line in os.environ["FW_CONFIG_ENDPOINTS"].splitlines()
+                for line in context.require("FW_CONFIG_ENDPOINTS").splitlines()
                 if len(parts := line.split()) >= 2
             }
         else:
             for proto, key in (
-                (os.environ.get("VLESS_NETWORK") or "tcp", "VLESS_PORT"),
+                (context.get("VLESS_NETWORK") or "tcp", "VLESS_PORT"),
                 ("udp", "HY2_PORT"),
                 ("tcp", "ANYTLS_PORT"),
                 ("udp", "TUIC_PORT"),
             ):
-                if os.environ.get(key):
-                    current.add((proto, int(os.environ[key])))
+                if context.get(key):
+                    current.add((proto, int(context.require(key))))
         if legacy:
             for proto, value in (
                 (sys.argv[5] if len(sys.argv) == 6 else "tcp", sys.argv[1]),
@@ -494,7 +497,7 @@ def ownership():
                     previous.add((proto, int(value)))
         previous.update(
             (parts[0], int(parts[1]))
-            for line in os.environ.get("FW_PREVIOUS_ENDPOINTS", "").splitlines()
+            for line in context.get("FW_PREVIOUS_ENDPOINTS", "").splitlines()
             if len(parts := line.split()) >= 2
         )
         retired = previous - current
@@ -523,7 +526,7 @@ def ownership():
                 if record["marker"] in line and f"{record['port']}/{record['proto']}" in line:
                     return
                 if re.search(r"\sALLOW\s+IN\s", line) and line.rstrip().endswith(
-                    os.environ["FW_SSH_MARK"]
+                    context.require("FW_SSH_MARK")
                 ):
                     continue  # The SSH ACCEPT safeguard may precede unrelated node ACCEPT rules.
                 if not any(marker in line for marker in known_markers):
@@ -590,12 +593,13 @@ def ownership():
 
 def nft_handles():
     import json
-    import os
     import sys
+
+    from sb_deploy.context import context
 
     for item in json.load(sys.stdin)["nftables"]:
         r = item.get("rule", {})
-        if r.get("comment") == os.environ["FW_MARK"]:
+        if r.get("comment") == context.require("FW_MARK"):
             print(r["family"], r["table"], r["chain"], r["handle"])
 
 

@@ -12,8 +12,10 @@ def archive():
     import tarfile
     import tempfile
 
-    app = pathlib.Path(os.environ["APP"])
-    config = pathlib.Path(os.environ["CONFIG"])
+    from sb_deploy.context import context
+
+    app = pathlib.Path(context.require("APP"))
+    config = pathlib.Path(context.require("CONFIG"))
     action = sys.argv[1]
     allowed_roots = {"rules", "tls", "client"}
 
@@ -41,7 +43,7 @@ def archive():
                 yield from tls_objects(child)
 
     if action == "create":
-        directory = pathlib.Path(os.environ["BACKUP_DIR"])
+        directory = pathlib.Path(context.require("BACKUP_DIR"))
 
         def inside(path, root):
             try:
@@ -56,8 +58,8 @@ def archive():
                 or inside(path, config.parent)
                 or path.resolve()
                 in (
-                    pathlib.Path(os.environ["MANAGER"]).resolve(),
-                    pathlib.Path(os.environ["HOP_UNIT_FILE"]).resolve(),
+                    pathlib.Path(context.require("MANAGER")).resolve(),
+                    pathlib.Path(context.require("HOP_UNIT_FILE")).resolve(),
                 )
             ):
                 sys.exit("备份必须保存在部署、配置和管理入口目录之外，防止备份被覆盖或随卸载删除。")
@@ -85,10 +87,10 @@ def archive():
             "format": 1,
             "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "app_path": str(app),
-            "kernel_version": os.environ.get("BACKUP_KERNEL_VERSION", "unknown"),
+            "kernel_version": context.get("BACKUP_KERNEL_VERSION", "unknown"),
             "service": {
-                "active": os.environ.get("BACKUP_SERVICE_ACTIVE") == "yes",
-                "enabled": os.environ.get("BACKUP_SERVICE_ENABLED") == "yes",
+                "active": context.get("BACKUP_SERVICE_ACTIVE") == "yes",
+                "enabled": context.get("BACKUP_SERVICE_ENABLED") == "yes",
             },
             "files": {},
         }

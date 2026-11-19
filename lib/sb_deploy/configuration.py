@@ -38,11 +38,12 @@ def configure_proxy(outbound, prefix, environment):
 
 def generate():
     import json
-    import os
     import pathlib
 
-    p = pathlib.Path(os.environ["APP"])
-    e = os.environ
+    from sb_deploy.context import context
+
+    p = pathlib.Path(context.require("APP"))
+    e = context
     log_level = e.get("LOG_LEVEL") or "warn"
     if log_level not in ("trace", "debug", "info", "warn", "error", "fatal", "panic"):
         raise SystemExit("LOG_LEVEL 必须是 trace、debug、info、warn、error、fatal 或 panic。")
@@ -234,7 +235,9 @@ def set_socks():
     import sys
     import tempfile
 
-    p = pathlib.Path(os.environ["CONFIG"])
+    from sb_deploy.context import context
+
+    p = pathlib.Path(context.require("CONFIG"))
     c = json.loads(p.read_text())
     for profile in sys.argv[1:]:
         tag = profile + "-socks"
@@ -261,7 +264,7 @@ def set_socks():
                     "connect_timeout": "5s",
                     "tcp_keep_alive": "2m",
                     "tcp_keep_alive_interval": "30s",
-                    "tcp_fast_open": os.environ["SOCKS_TFO"] == "true",
+                    "tcp_fast_open": context.require("SOCKS_TFO") == "true",
                 }
             ]
             c["outbounds"].append(matches[0])
@@ -269,14 +272,14 @@ def set_socks():
             sys.exit(f"Expected exactly one supported proxy outbound: {tag}")
         prefix = profile.upper() + "_SOCKS"
         matches[0].update(
-            server=os.environ[prefix + "_HOST"],
-            server_port=int(os.environ[prefix + "_PORT"]),
-            username=os.environ[prefix + "_USER"],
-            password=os.environ[prefix + "_PASS"],
+            server=context.require(prefix + "_HOST"),
+            server_port=int(context.require(prefix + "_PORT")),
+            username=context.require(prefix + "_USER"),
+            password=context.require(prefix + "_PASS"),
         )
-        configure_proxy(matches[0], prefix, os.environ)
-        if os.environ["REQUEST_SOCKS_TFO"]:
-            matches[0]["tcp_fast_open"] = os.environ["REQUEST_SOCKS_TFO"] == "true"
+        configure_proxy(matches[0], prefix, context)
+        if context.require("REQUEST_SOCKS_TFO"):
+            matches[0]["tcp_fast_open"] = context.require("REQUEST_SOCKS_TFO") == "true"
     if "other" in sys.argv[1:]:
         c["route"]["final"] = "other-socks"
     with tempfile.NamedTemporaryFile(mode="w", dir=p.parent, prefix=".config-", delete=False) as f:
@@ -336,14 +339,15 @@ def fingerprint():
 
 def edit_field():
     import json
-    import os
     import pathlib
     import re
     import sys
 
+    from sb_deploy.context import context
+
     obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
     pointer = sys.argv[3]
-    value = os.environ["FIELD_VALUE"]
+    value = context.require("FIELD_VALUE")
     if not pointer.startswith("/") or re.search(r"~(?![01])", pointer):
         sys.exit("字段路径必须为 JSON Pointer，例如 /tls/handshake_timeout。")
     keys = [p.replace("~1", "/").replace("~0", "~") for p in pointer[1:].split("/")]

@@ -3,7 +3,6 @@
 import contextlib
 import io
 import json
-import os
 import shlex
 import shutil
 import subprocess
@@ -16,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 from sb_deploy import backup, certificates, configuration, firewall, hopping, network, nodes
+from sb_deploy import context as sb_context
 from sb_deploy.bundle import bundle_script
 
 
@@ -35,7 +35,7 @@ class ModuleTests(unittest.TestCase):
     def invoke(self, function, *args, env=None, stdin=""):
         output = io.StringIO()
         with (
-            patch.dict(os.environ, {**self.env, **(env or {})}),
+            sb_context.temporary({**self.env, **(env or {})}),
             patch.object(sys, "argv", ["module", *map(str, args)]),
             patch.object(sys, "stdin", io.StringIO(stdin)),
             contextlib.redirect_stdout(output),
@@ -244,6 +244,18 @@ class ModuleTests(unittest.TestCase):
         for address in ("192.168.1.1", "not-an-ip", "::1"):
             with self.subTest(address=address), self.assertRaises(SystemExit):
                 self.invoke(network.public_ipv4, env={"SERVER_IP": address})
+
+    def test_context_protocol_version_and_framing_are_enforced(self):
+        parsed = sb_context._parse(b"SBD_CONTEXT\0" + b"1\0EMPTY\0\0READY\0")
+        self.assertEqual(parsed, {"EMPTY": ""})
+        for raw in (
+            b"SBD_CONTEXT\0" + b"2\0KEY\0value\0READY\0",
+            b"SBD_CONTEXT\0" + b"1\0KEY\0value\0",
+            b"SBD_CONTEXT\0" + b"1\0KEY\0value\0BROKEN\0",
+            b"SBD_CONTEXT\0" + b"1\0KEY\0value\0READY\0EXTRA\0",
+        ):
+            with self.subTest(raw=raw), self.assertRaises(SystemExit):
+                sb_context._parse(raw)
 
     def test_backup_service_state_reads_manifest(self):
         path = self.root / "manifest.json"

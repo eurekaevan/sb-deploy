@@ -70,7 +70,7 @@ chmod +x sing-box-deploy.sh
 python3 -B scripts/build_release.py --output dist/sing-box-deploy.sh
 ```
 
-将生成的 `dist/sing-box-deploy.sh` 单独复制到服务器即可运行，不需要安装 Python 第三方依赖。打包保留源码顶部的默认参数；修改默认值后需重新打包。发布包通过 fd 3 把内嵌模块交给 Python，不占用命令行参数长度或调用方的 stdin。以下命令可用于源码版，也可用于生成的发布脚本。
+将生成的 `dist/sing-box-deploy.sh` 单独复制到服务器即可运行，不需要安装 Python 第三方依赖。打包保留源码顶部的默认参数；修改默认值后需重新打包。发布包通过 fd 3 把内嵌模块交给 Python，并通过 fd 4 传递版本化的 NUL 分隔运行上下文，不占用命令行参数长度或调用方的 stdin；密码、私钥等待写入字段值不会进入 argv 或子进程环境。以下命令可用于源码版，也可用于生成的发布脚本。
 
 ### 2. 进入管理菜单
 
@@ -499,6 +499,18 @@ sudo UNINSTALL_CONFIRM=YES bash sing-box-deploy.sh uninstall
 
 > 建议在 root shell 中使用权限为 `0600` 的环境文件加载凭据，避免密码进入 shell 历史或进程参数。
 
+### Shell 与 Python 运行上下文
+
+Bash 与 Python 不再通过环境变量传递配置和凭据。Bash 在调用 Python 时通过 fd 4 写入版本化上下文：
+
+```text
+SBD_CONTEXT\0 1\0 KEY\0VALUE\0 ... READY\0
+```
+
+首帧固定为 `SBD_CONTEXT`，第二帧是协议版本 `1`，随后是成对的键和值，最后一帧为 `READY`。Python 的 `sb_deploy.context` 在启动时读取并校验该流；版本不匹配或格式错误会直接失败，并提示使用配套的 shell 脚本；空值也作为有效值保留。该通道独立于命令行参数、环境变量和 stdin，因此 Python 及其子进程不会从环境变量获得密码、私钥、UUID、待写入字段值，`ps` 也不会显示这些值。直接调用 Python 模块的测试通过 `sb_deploy.context.temporary()` 注入同一份映射。
+
+从环境变量启动脚本时，已知凭据变量仍可作为输入覆盖，但脚本会在启动早期移除它们的 `export` 属性；它们只保留为当前 shell 的变量，随后仅通过 fd 4 传给 Python。代理主机、端口等非秘密参数仍可作为环境变量使用。
+
 HTTPS 代理默认校验证书。已保存配置若包含 `tls.insecure: true`，`status`、`apply` 前摘要和 `check` 会显示醒目警告；仅在明确信任该中间代理时才应保留此设置。
 
 示例：
@@ -664,9 +676,10 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 ├── README.md
 ├── sing-box-deploy.sh          # Bash 管理界面、事务、systemd 与包管理
 ├── lib/
-│   ├── runner.py              # 保留 stdin/argv 的模块调用入口
+│   ├── runner.py              # 先读取 fd 4 上下文，再按模块/动作分派
 │   └── sb_deploy/
 │       ├── __init__.py        # Python 包入口
+│       ├── context.py         # 版本化 Shell→Python 上下文协议
 │       ├── configuration.py   # 配置生成、代理出口编辑、TLS 路径与字段修改
 │       ├── nodes.py           # 协议配置、动态菜单及客户端导出
 │       ├── certificates.py    # 到期检测与托管自签续期
@@ -683,7 +696,7 @@ python3 tests/hopping_integration.py --sing-box /usr/bin/sing-box
 │   ├── test_deploy.py         # 隔离系统生命周期回归（慢组）
 │   └── hopping_integration.py # 真实 Hysteria2 跳跃测试（network namespace）
 ├── .github/workflows/
-│   ├── ci.yml                # 静态检查与 Debian/Fedora 测试
+│   ├── ci.yml                # 静态检查与 Debian/Ubuntu/Fedora 测试
 │   └── nightly.yml           # 固定真实内核的每日网络集成
 ├── requirements-dev.txt       # 固定开发检查工具；服务器无需安装
 ├── ruff.toml                 # Python 静态检查规则

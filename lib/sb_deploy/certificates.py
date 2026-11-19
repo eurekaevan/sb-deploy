@@ -5,7 +5,6 @@ def status():
     import datetime
     import json
     import math
-    import os
     import pathlib
     import re
     import shutil
@@ -13,15 +12,17 @@ def status():
     import subprocess
     import sys
 
+    from sb_deploy.context import context
+
     def emit(level, message):
         sys.stdout.write(level + "\0" + message + "\0")
 
     try:
-        value = os.environ.get("CERT_WARN_DAYS", "")
+        value = context.get("CERT_WARN_DAYS", "")
         if not re.fullmatch(r"[0-9]+", value):
             raise ValueError("CERT_WARN_DAYS 必须是非负整数。")
         warning_days = int(value)
-        config = json.loads(pathlib.Path(os.environ["CONFIG"]).read_text())
+        config = json.loads(pathlib.Path(context.require("CONFIG")).read_text())
         if not isinstance(config, dict) or not isinstance(config.get("inbounds", []), list):
             raise ValueError("配置中的 inbounds 必须是数组。")
     except (OSError, UnicodeError, ValueError, KeyError) as error:
